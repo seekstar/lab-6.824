@@ -537,10 +537,10 @@ func heartbeatTrigger(heartbeat chan struct{}, quit chan struct{}) {
 	}
 }
 
-// [5, 10) * heartbeat_interval
+// [3, 5) * heartbeat_interval
 func (rf *Raft) genRandElectionTimeout() time.Duration {
 	rf.mu.Lock()
-	ret := (1 + rf.randGen.Float64()) * 5 * float64(heartbeat_interval)
+	ret := (rf.randGen.Float64()*2 + 3) * float64(heartbeat_interval)
 	rf.mu.Unlock()
 	// rf.logger.Printf("Generated election timeout: %f\n", ret)
 	return time.Duration(ret)
@@ -556,7 +556,7 @@ func (rf *Raft) electionEpochOnce(electionEpochFire chan struct{}, quit chan str
 }
 
 // Use epoch style to save time.
-// So the election timeout is actually [5, 20) hearbeat intervals
+// So the election timeout is actually [3, 10) hearbeat intervals
 func (rf *Raft) electionEpochTrigger(electionEpochFire chan struct{}, cont chan struct{}, quit chan struct{}) {
 	for {
 		rf.electionEpochOnce(electionEpochFire, quit)
