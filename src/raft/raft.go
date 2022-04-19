@@ -392,13 +392,13 @@ func (rf *Raft) updateTerm(term int) {
 // For candidates and leaders, if rf.votedFor == -1, then currentTerm is updated,
 // and they should convert to followers.
 func (rf *Raft) handleVoteRequest(args *RequestVoteArgs) (reply RequestVoteReply) {
-	fmt.Printf("%d: handleVoteRequest: Term = %d, CandidateId = %d, LastLogIndex = %d, LastLogTerm = %d, currentTerm = %d, votedFor = %d ",
-		rf.me, args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm,
-		rf.currentTerm, rf.votedFor)
+	// fmt.Printf("%d: handleVoteRequest: Term = %d, CandidateId = %d, LastLogIndex = %d, LastLogTerm = %d, currentTerm = %d, votedFor = %d ",
+	// 	rf.me, args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm,
+	// 	rf.currentTerm, rf.votedFor)
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-		fmt.Printf("refused\n")
+		// fmt.Printf("refused\n")
 		return
 	}
 	if rf.currentTerm < args.Term {
@@ -407,15 +407,15 @@ func (rf *Raft) handleVoteRequest(args *RequestVoteArgs) (reply RequestVoteReply
 	reply.Term = rf.currentTerm
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
 		reply.VoteGranted = false
-		fmt.Printf("refused\n")
+		// fmt.Printf("refused\n")
 		return
 	}
 	reply.VoteGranted = rf.LogUpToDate(args)
-	if reply.VoteGranted {
-		fmt.Printf("granted\n")
-	} else {
-		fmt.Printf("refused\n")
-	}
+	// if reply.VoteGranted {
+	// 	fmt.Printf("granted\n")
+	// } else {
+	// 	fmt.Printf("refused\n")
+	// }
 	return
 }
 
@@ -518,12 +518,12 @@ func (rf *Raft) appendEntries(args *AppendEntriesArgs) (reply AppendEntriesReply
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	fmt.Printf("%d: AppendEntries from %d request received\n", rf.me, args.LeaderId)
+	// fmt.Printf("%d: AppendEntries from %d request received\n", rf.me, args.LeaderId)
 	replyChan := make(chan AppendEntriesReply)
 	rf.appendEntriesChan <- AppendEntriesArgsReply{args, replyChan}
-	fmt.Printf("%d: RPC AppendEntries: sent to raft server\n", rf.me)
+	// fmt.Printf("%d: RPC AppendEntries: sent to raft server\n", rf.me)
 	*reply = <-replyChan
-	fmt.Printf("%d: RPC AppendEntries: return\n", rf.me)
+	// fmt.Printf("%d: RPC AppendEntries: return\n", rf.me)
 }
 
 func heartbeatTrigger(heartbeat chan struct{}, quit chan struct{}) {
@@ -586,31 +586,20 @@ type Replicator struct {
 	closed     chan struct{}
 }
 
-func (r *Replicator) caller(argsCh chan *AppendEntriesArgs, replyCh chan AppendEntriesReply) {
-	var args *AppendEntriesArgs
-	var reply AppendEntriesReply
-	for {
+func (r *Replicator) callAppendEntries(args *AppendEntriesArgs, replyCh chan *AppendEntriesReply) {
+	// fmt.Printf("%d: AppendEntires RPC to %d\n", r.me, r.to)
+	reply := AppendEntriesReply{}
+	ok := r.rf.peers[r.to].Call("Raft.AppendEntries", args, &reply)
+	// fmt.Printf("%d: AppendEntries RPC to %d returns %t\n", r.me, r.to, ok)
+	if ok {
 		select {
 		case <-r.quit:
-			return
-		case args = <-argsCh:
+		case replyCh <- &reply:
 		}
-		fmt.Printf("%d: AppendEntires RPC to %d\n", r.me, r.to)
-		for {
-			// Reply of RPC can not be reused
-			// otherwise labgob warning: Decoding into a non-default variable/field Term may not work
-			// https://zhuanlan.zhihu.com/p/352832240
-			reply = AppendEntriesReply{}
-			ok := r.rf.peers[r.to].Call("Raft.AppendEntries", args, &reply)
-			if ok {
-				fmt.Printf("%d: AppendEntries RPC to %d return\n", r.me, r.to)
-				break
-			}
-			fmt.Printf("%d: AppendEntries RPC to %d Retry\n", r.me, r.to)
-		}
+	} else {
 		select {
 		case <-r.quit:
-		case replyCh <- reply:
+		case replyCh <- nil:
 		}
 	}
 }
@@ -623,63 +612,72 @@ func (r *Replicator) run() {
 	r.rf.mu.Unlock()
 	matchIndex := 0
 
-	// To make sure that replicator could close quickly without being blocked by RPC
-	argsCh := make(chan *AppendEntriesArgs)
-	replyCh := make(chan AppendEntriesReply)
-	go r.caller(argsCh, replyCh)
-
-	replicate := func(heartbeat bool) {
+	do_heartbeat := func() {
 		args := &AppendEntriesArgs{
 			Term:     r.currentTerm,
 			LeaderId: r.me,
 		}
-		if heartbeat {
-			fmt.Printf("%d: Heartbeat to %d\n", r.me, r.to)
-		} else {
-			fmt.Printf("%d: Replicating to %d\n", r.me, r.to)
+		// fmt.Printf("%d: Heartbeat to %d\n", r.me, r.to)
+		r.rf.mu.Lock()
+		args.PrevLogIndex = nextIndex - 1
+		args.PrevLogTerm = r.rf.LogTerm(args.PrevLogIndex)
+		args.LeaderCommit = r.rf.commitIndex
+		args.Entries = nil
+		r.rf.mu.Unlock()
+		reply := AppendEntriesReply{}
+		ok := r.rf.peers[r.to].Call("Raft.AppendEntries", args, &reply)
+		if !ok || reply.Success {
+			return
 		}
+		if reply.Term > r.currentTerm {
+			// Discovers server with higher term.
+			select {
+			case <-r.quit:
+			case r.higherTerm <- reply.Term:
+			}
+			return
+		}
+	}
+
+	replicate := func() {
+		args := &AppendEntriesArgs{
+			Term:     r.currentTerm,
+			LeaderId: r.me,
+		}
+		// fmt.Printf("%d: Replicating to %d\n", r.me, r.to)
 		for {
 			r.rf.mu.Lock()
 			args.PrevLogIndex = nextIndex - 1
 			args.PrevLogTerm = r.rf.LogTerm(args.PrevLogIndex)
-			to_append := len(r.rf.log) + r.rf.log_base_index - nextIndex
-			if heartbeat {
-				args.Entries = nil
-			} else {
-				args.Entries = r.rf.log[nextIndex-r.rf.log_base_index:]
-			}
 			args.LeaderCommit = r.rf.commitIndex
+			args.Entries = r.rf.log[nextIndex-r.rf.log_base_index:]
 			r.rf.mu.Unlock()
 			// r.rf.logger.Printf("%d: nextIndex = %d\n", r.to, nextIndex)
-			select {
-			case <-r.quit:
-				return
-			case argsCh <- args:
-			}
-			var reply AppendEntriesReply
+
+			// Use go routine to make sure that replicator could close quickly without being blocked by RPC
+			replyCh := make(chan *AppendEntriesReply)
+			go r.callAppendEntries(args, replyCh)
+			var reply *AppendEntriesReply
 			select {
 			case <-r.quit:
 				return
 			case reply = <-replyCh:
 			}
+			if reply == nil {
+				// Retry
+				continue
+			}
 			if reply.Success {
-				if heartbeat {
-					if to_append != 0 {
-						heartbeat = false
-						continue
-					}
-				} else {
-					nextIndex += to_append
-					if nextIndex-1 > matchIndex {
-						matchIndex = nextIndex - 1
-						select {
-						case <-r.quit:
-							return
-						case r.matchIndex <- IntPair{r.to, matchIndex}:
-						}
+				nextIndex += len(args.Entries)
+				if nextIndex-1 > matchIndex {
+					matchIndex = nextIndex - 1
+					select {
+					case <-r.quit:
+						return
+					case r.matchIndex <- IntPair{r.to, matchIndex}:
 					}
 				}
-				fmt.Printf("Good! Now matchIndex of %d is %d\n", r.to, matchIndex)
+				// fmt.Printf("Good! Now matchIndex of %d is %d\n", r.to, matchIndex)
 				return
 			}
 			if reply.Term > r.currentTerm {
@@ -703,17 +701,18 @@ func (r *Replicator) run() {
 		select {
 		case <-r.quit:
 			r.closed <- struct{}{}
-			fmt.Printf("%d: Replicator %d closed\n", r.me, r.to)
+			// fmt.Printf("%d: Replicator %d closed\n", r.me, r.to)
 			return
 		case <-heartbeat:
 			if sent {
 				sent = false
 				break
 			}
-			replicate(true)
+			// Use go routine to make sure that the heartbeats are sent periodically even when the RPC call does not return.
+			go do_heartbeat()
 		case <-r.log_grow:
 			sent = true
-			replicate(false)
+			replicate()
 		}
 	}
 }
@@ -726,7 +725,7 @@ const (
 )
 
 func (rf *Raft) doFollower() (next int) {
-	fmt.Printf("%d: doFollower, currentTerm = %d\n", rf.me, rf.currentTerm)
+	// fmt.Printf("%d: doFollower, currentTerm = %d\n", rf.me, rf.currentTerm)
 	good_epoch := false
 	electionEpochFire := make(chan struct{})
 	cont := make(chan struct{}) // Continue
@@ -750,7 +749,7 @@ func (rf *Raft) doFollower() (next int) {
 			next = StateCandidate
 			return
 		case req := <-rf.getStateCh:
-			fmt.Printf("%d: I am a follower, currentTerm = %d\n", rf.me, rf.currentTerm)
+			// fmt.Printf("%d: I am a follower, currentTerm = %d\n", rf.me, rf.currentTerm)
 			req <- ServerState{rf.me, rf.currentTerm, false}
 		case req := <-rf.requestVoteCh:
 			req.reply <- rf.handleVoteRequest(req.args)
@@ -763,7 +762,7 @@ func (rf *Raft) doFollower() (next int) {
 	}
 }
 func (rf *Raft) doCandidate() (next int) {
-	fmt.Printf("%d: doCandidate, currentTerm = %d\n", rf.me, rf.currentTerm)
+	// fmt.Printf("%d: doCandidate, currentTerm = %d\n", rf.me, rf.currentTerm)
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	args := &RequestVoteArgs{
@@ -796,7 +795,7 @@ func (rf *Raft) doCandidate() (next int) {
 			next = StateCandidate
 			return
 		case req := <-rf.getStateCh:
-			fmt.Printf("%d: I am a candidate, currentTerm = %d\n", rf.me, rf.currentTerm)
+			// fmt.Printf("%d: I am a candidate, currentTerm = %d\n", rf.me, rf.currentTerm)
 			req <- ServerState{rf.me, rf.currentTerm, false}
 		case req := <-rf.requestVoteCh:
 			req.reply <- rf.handleVoteRequest(req.args)
@@ -840,7 +839,7 @@ func (rf *Raft) doCandidate() (next int) {
 	}
 }
 func (rf *Raft) doLeader() (next int) {
-	fmt.Printf("%d: doLeader, currentTerm = %d\n", rf.me, rf.currentTerm)
+	// fmt.Printf("%d: doLeader, currentTerm = %d\n", rf.me, rf.currentTerm)
 	matchIndexes := make([]int, len(rf.peers))
 	matchIndexes[rf.me] = rf.LastLogIndex()
 
@@ -882,7 +881,7 @@ func (rf *Raft) doLeader() (next int) {
 			next = StateFollower
 			return
 		case req := <-rf.getStateCh:
-			fmt.Printf("%d: I am the leader, currentTerm = %d\n", rf.me, rf.currentTerm)
+			// fmt.Printf("%d: I am the leader, currentTerm = %d\n", rf.me, rf.currentTerm)
 			req <- ServerState{rf.me, rf.currentTerm, true}
 		case req := <-rf.requestVoteCh:
 			req.reply <- rf.handleVoteRequest(req.args)
