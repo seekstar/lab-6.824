@@ -612,14 +612,14 @@ func (r *Replicator) run() {
 	r.rf.mu.Unlock()
 	matchIndex := 0
 
-	do_heartbeat := func() {
+	do_heartbeat := func(nextIndex int) {
 		args := &AppendEntriesArgs{
 			Term:     r.currentTerm,
 			LeaderId: r.me,
 		}
 		// fmt.Printf("%d: Heartbeat to %d\n", r.me, r.to)
-		r.rf.mu.Lock()
 		args.PrevLogIndex = nextIndex - 1
+		r.rf.mu.Lock()
 		args.PrevLogTerm = r.rf.LogTerm(args.PrevLogIndex)
 		args.LeaderCommit = r.rf.commitIndex
 		args.Entries = nil
@@ -646,8 +646,8 @@ func (r *Replicator) run() {
 		}
 		// fmt.Printf("%d: Replicating to %d\n", r.me, r.to)
 		for {
-			r.rf.mu.Lock()
 			args.PrevLogIndex = nextIndex - 1
+			r.rf.mu.Lock()
 			args.PrevLogTerm = r.rf.LogTerm(args.PrevLogIndex)
 			args.LeaderCommit = r.rf.commitIndex
 			args.Entries = r.rf.log[nextIndex-r.rf.log_base_index:]
@@ -709,7 +709,7 @@ func (r *Replicator) run() {
 				break
 			}
 			// Use go routine to make sure that the heartbeats are sent periodically even when the RPC call does not return.
-			go do_heartbeat()
+			go do_heartbeat(nextIndex)
 		case <-r.log_grow:
 			sent = true
 			replicate()
