@@ -141,12 +141,6 @@ func (rf *Raft) GetState() (int, bool) {
 	replyCh := make(chan ServerState)
 	rf.getStateCh <- replyCh
 	reply := <-replyCh
-	// fmt.Printf("%d %d: ", reply.me, reply.term)
-	// if reply.isLeader {
-	// 	fmt.Printf("Is leader")
-	// } else {
-	// 	fmt.Println("Not leader")
-	// }
 	return reply.term, reply.isLeader
 }
 
@@ -392,13 +386,13 @@ func (rf *Raft) updateTerm(term int) {
 // For candidates and leaders, if rf.votedFor == -1, then currentTerm is updated,
 // and they should convert to followers.
 func (rf *Raft) handleVoteRequest(args *RequestVoteArgs) (reply RequestVoteReply) {
-	// fmt.Printf("%d: handleVoteRequest: Term = %d, CandidateId = %d, LastLogIndex = %d, LastLogTerm = %d, currentTerm = %d, votedFor = %d ",
-	// 	rf.me, args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm,
-	// 	rf.currentTerm, rf.votedFor)
+	DPrintf("%d: handleVoteRequest: Term = %d, CandidateId = %d, LastLogIndex = %d, LastLogTerm = %d, currentTerm = %d, votedFor = %d ",
+		rf.me, args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm,
+		rf.currentTerm, rf.votedFor)
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-		// fmt.Printf("refused\n")
+		DPrintf("refused\n")
 		return
 	}
 	if rf.currentTerm < args.Term {
@@ -407,15 +401,15 @@ func (rf *Raft) handleVoteRequest(args *RequestVoteArgs) (reply RequestVoteReply
 	reply.Term = rf.currentTerm
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
 		reply.VoteGranted = false
-		// fmt.Printf("refused\n")
+		DPrintf("refused\n")
 		return
 	}
 	reply.VoteGranted = rf.LogUpToDate(args)
-	// if reply.VoteGranted {
-	// 	fmt.Printf("granted\n")
-	// } else {
-	// 	fmt.Printf("refused\n")
-	// }
+	if reply.VoteGranted {
+		DPrintf("granted\n")
+	} else {
+		DPrintf("refused\n")
+	}
 	return
 }
 
@@ -462,7 +456,7 @@ func (rf *Raft) ApplyCmds() {
 		rf.lastApplied++
 		cmd := rf.log[rf.lastApplied-rf.log_base_index].Command
 		rf.applyCh <- ApplyMsg{true, cmd, rf.lastApplied, true, nil, 0, 0}
-		// rf.logger.Printf("%d: %d %d applied\n", rf.me, rf.lastApplied, cmd)
+		DPrintf("%d: %d %d applied\n", rf.me, rf.lastApplied, cmd)
 	}
 }
 
@@ -701,7 +695,7 @@ func (r *Replicator) run() {
 		select {
 		case <-r.quit:
 			r.closed <- struct{}{}
-			// fmt.Printf("%d: Replicator %d closed\n", r.me, r.to)
+			DPrintf("%d: Replicator %d closed\n", r.me, r.to)
 			return
 		case <-heartbeat:
 			if sent {
@@ -725,7 +719,7 @@ const (
 )
 
 func (rf *Raft) doFollower() (next int) {
-	// fmt.Printf("%d: doFollower, currentTerm = %d\n", rf.me, rf.currentTerm)
+	DPrintf("%d: doFollower, currentTerm = %d\n", rf.me, rf.currentTerm)
 	good_epoch := false
 	electionEpochFire := make(chan struct{})
 	cont := make(chan struct{}) // Continue
@@ -762,7 +756,7 @@ func (rf *Raft) doFollower() (next int) {
 	}
 }
 func (rf *Raft) doCandidate() (next int) {
-	// fmt.Printf("%d: doCandidate, currentTerm = %d\n", rf.me, rf.currentTerm)
+	DPrintf("%d: doCandidate, currentTerm = %d\n", rf.me, rf.currentTerm)
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	args := &RequestVoteArgs{
@@ -839,7 +833,7 @@ func (rf *Raft) doCandidate() (next int) {
 	}
 }
 func (rf *Raft) doLeader() (next int) {
-	// fmt.Printf("%d: doLeader, currentTerm = %d\n", rf.me, rf.currentTerm)
+	DPrintf("%d: doLeader, currentTerm = %d\n", rf.me, rf.currentTerm)
 	matchIndexes := make([]int, len(rf.peers))
 	matchIndexes[rf.me] = rf.LastLogIndex()
 
@@ -858,7 +852,7 @@ func (rf *Raft) doLeader() (next int) {
 		go r.run()
 	}
 	abort := func() {
-		// rf.logger.Printf("%d: Aborting\n", rf.me)
+		DPrintf("%d: Leader aborting\n", rf.me)
 		close(quit)
 		// Then make sure that all replicators are closed
 		closedCnt := 0
@@ -892,7 +886,7 @@ func (rf *Raft) doLeader() (next int) {
 				return
 			}
 		case req := <-rf.putCmdCh:
-			// rf.logger.Printf("%d: Putting command\n", rf.me)
+			fmt.Printf("%d: Putting command\n", rf.me)
 			rf.mu.Lock()
 			i := rf.log_base_index + len(rf.log)
 			reply := PutCmdReply{i, rf.currentTerm, true}
