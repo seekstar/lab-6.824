@@ -886,7 +886,7 @@ func (rf *Raft) doLeader() (next int) {
 				return
 			}
 		case req := <-rf.putCmdCh:
-			// fmt.Printf("%d: Putting command\n", rf.me)
+			DPrintf("%d: Putting command\n", rf.me)
 			rf.mu.Lock()
 			i := rf.log_base_index + len(rf.log)
 			reply := PutCmdReply{i, rf.currentTerm, true}
