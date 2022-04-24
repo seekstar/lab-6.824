@@ -408,7 +408,7 @@ func (rf *Raft) handleVoteRequest(args *RequestVoteArgs) (reply RequestVoteReply
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-		DPrintf("refused\n")
+		DPrintf("%d: Refuse for outdated term. currentTerm = %d\n", rf.me, rf.currentTerm)
 		return
 	}
 	if rf.currentTerm < args.Term {
@@ -417,7 +417,7 @@ func (rf *Raft) handleVoteRequest(args *RequestVoteArgs) (reply RequestVoteReply
 	reply.Term = rf.currentTerm
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
 		reply.VoteGranted = false
-		DPrintf("refused\n")
+		DPrintf("%d: Refuse because already voted for %d\n", rf.me, rf.votedFor)
 		return
 	}
 	reply.VoteGranted = rf.LogUpToDate(args)
@@ -428,7 +428,7 @@ func (rf *Raft) handleVoteRequest(args *RequestVoteArgs) (reply RequestVoteReply
 		}
 		DPrintf("granted\n")
 	} else {
-		DPrintf("refused\n")
+		DPrintf("%d: Refuse for outdated log\n", rf.me)
 	}
 	return
 }
