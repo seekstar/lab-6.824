@@ -644,7 +644,11 @@ func (r *Replicator) run() {
 			r.rf.mu.Lock()
 			args.PrevLogTerm = r.rf.LogTerm(args.PrevLogIndex)
 			args.LeaderCommit = r.rf.commitIndex
-			args.Entries = r.rf.log[nextIndex-r.rf.log_base_index:]
+			// It does not affect correctness if we only take reference here.
+			// But it might lead to race condition if it becomes a follower and
+			// the log is modified by the new leader while sending the RPC.
+			args.Entries = make([]LogEntry, len(r.rf.log)-(nextIndex-r.rf.log_base_index))
+			copy(args.Entries, r.rf.log[nextIndex-r.rf.log_base_index:])
 			r.rf.mu.Unlock()
 			// r.rf.logger.Printf("%d: nextIndex = %d\n", r.to, nextIndex)
 
