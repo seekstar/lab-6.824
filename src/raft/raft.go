@@ -229,6 +229,7 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	DPrintf("%d: RPC RequestVote, candidate %d, term %d\n", rf.me, args.CandidateId, args.Term)
 	replyCh := make(chan RequestVoteReply)
 	rf.requestVoteCh <- VoteReq{args, replyCh}
 	*reply = <-replyCh
@@ -568,12 +569,12 @@ type IntPair struct {
 }
 
 type Replicator struct {
-	rf          *Raft
-	currentTerm int
-	me          int
-	to          int
-	log_grow    chan struct{}
-	quit        chan struct{}
+	rf             *Raft
+	currentTerm    int
+	me             int
+	to             int
+	need_replicate chan struct{}
+	quit           chan struct{}
 
 	matchIndex chan IntPair
 	higherTerm chan int
@@ -631,6 +632,14 @@ func (r *Replicator) run() {
 			}
 			return
 		}
+		nextIndex--
+		if nextIndex == 0 {
+			panic("nextIndex == 0!")
+		}
+		select {
+		case r.need_replicate <- struct{}{}:
+		default:
+		}
 	}
 
 	replicate := func() {
@@ -669,13 +678,13 @@ func (r *Replicator) run() {
 				nextIndex += len(args.Entries)
 				if nextIndex-1 > matchIndex {
 					matchIndex = nextIndex - 1
+					DPrintf("Replicator %d of %d: Updating matchIndex to %d\n", r.to, r.me, matchIndex)
 					select {
 					case <-r.quit:
 						return
 					case r.matchIndex <- IntPair{r.to, matchIndex}:
 					}
 				}
-				// fmt.Printf("Good! Now matchIndex of %d is %d\n", r.to, matchIndex)
 				return
 			}
 			if reply.Term > r.currentTerm {
@@ -708,7 +717,7 @@ func (r *Replicator) run() {
 			}
 			// Use go routine to make sure that the heartbeats are sent periodically even when the RPC call does not return.
 			go do_heartbeat(nextIndex)
-		case <-r.log_grow:
+		case <-r.need_replicate:
 			sent = true
 			replicate()
 		}
@@ -730,7 +739,7 @@ func (rf *Raft) doFollower() (next int) {
 	quit := make(chan struct{})
 	go rf.electionEpochTrigger(electionEpochFire, cont, quit)
 	for {
-		// rf.logger.Printf("%d(Follower): Listening\n", rf.me)
+		DPrintf("%d(Follower): Listening\n", rf.me)
 		select {
 		case <-rf.quit:
 			close(quit)
@@ -783,6 +792,7 @@ func (rf *Raft) doCandidate() (next int) {
 	electionEpochFire := make(chan struct{})
 	go rf.electionEpochOnce(electionEpochFire, abort)
 	for {
+		DPrintf("%d(Candidate): Listening\n", rf.me)
 		select {
 		case <-rf.quit:
 			close(abort)
@@ -866,6 +876,7 @@ func (rf *Raft) doLeader() (next int) {
 		}
 	}
 	for {
+		DPrintf("%d(Leader): Listening\n", rf.me)
 		select {
 		case <-rf.quit:
 			abort()
@@ -890,7 +901,7 @@ func (rf *Raft) doLeader() (next int) {
 				return
 			}
 		case req := <-rf.putCmdCh:
-			DPrintf("%d: Putting command\n", rf.me)
+			DPrintf("%d: Putting command %d\n", rf.me, req.cmd)
 			rf.mu.Lock()
 			i := rf.log_base_index + len(rf.log)
 			reply := PutCmdReply{i, rf.currentTerm, true}
