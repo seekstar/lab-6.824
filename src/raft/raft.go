@@ -407,6 +407,9 @@ func (rf *Raft) handleVoteRequest(args *RequestVoteArgs) (reply RequestVoteReply
 	}
 	reply.VoteGranted = rf.LogUpToDate(args)
 	if reply.VoteGranted {
+		if rf.votedFor == -1 {
+			rf.votedFor = args.CandidateId
+		}
 		DPrintf("granted\n")
 	} else {
 		DPrintf("refused\n")
