@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sort"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -151,35 +153,44 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	DPrintf("%d: Persisting currentTerm = %d, votedFor = %d, log_base_index = %d, log = %v\n", rf.me, rf.currentTerm, rf.votedFor, rf.log_base_index, rf.log)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log_base_index)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
 // restore previously persisted state.
 //
-func (rf *Raft) readPersist(data []byte) {
+// Return false if succeed, true if fail
+func (rf *Raft) readPersist(data []byte) bool {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
+		return false
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log_base_index int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log_base_index) != nil ||
+		d.Decode(&log) != nil {
+		return true
+	}
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.log_base_index = log_base_index
+	rf.log = log
+	DPrintf("%d: readPersist: currentTerm = %d, votedFor = %d, log_base_index = %d, log = %v\n", rf.me, rf.currentTerm, rf.votedFor, rf.log_base_index, rf.log)
+	return false
 }
 
 //
@@ -342,7 +353,10 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.quit = make(chan struct{})
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	if rf.readPersist(persister.ReadRaftState()) {
+		fmt.Printf("%d: Fail to read persistend data!\n", rf.me)
+		return nil
+	}
 
 	go rf.do(StateFollower)
 
@@ -382,6 +396,7 @@ func (rf *Raft) LogUpToDate(args *RequestVoteArgs) bool {
 func (rf *Raft) updateTerm(term int) {
 	rf.currentTerm = term
 	rf.votedFor = -1
+	rf.persist()
 }
 
 // For candidates and leaders, if rf.votedFor == -1, then currentTerm is updated,
@@ -409,6 +424,7 @@ func (rf *Raft) handleVoteRequest(args *RequestVoteArgs) (reply RequestVoteReply
 	if reply.VoteGranted {
 		if rf.votedFor == -1 {
 			rf.votedFor = args.CandidateId
+			rf.persist()
 		}
 		DPrintf("granted\n")
 	} else {
@@ -478,6 +494,7 @@ func (rf *Raft) _appendEntries(args *AppendEntriesArgs) bool {
 	} else {
 		if rf.log[i].Term != args.PrevLogTerm {
 			rf.log = rf.log[:i]
+			rf.persist()
 			return false
 		}
 	}
@@ -493,7 +510,9 @@ func (rf *Raft) _appendEntries(args *AppendEntriesArgs) bool {
 	}
 	// To avoid the outdated AppendEntries RPC delete the commited log entires
 	if j < len(args.Entries) {
+		fmt.Printf("%d: rf.log = %v, args.Entries = %v\n", rf.me, rf.log, args.Entries)
 		rf.log = append(rf.log[:i], args.Entries[j:]...)
+		rf.persist()
 	}
 	// rf.logger.Printf("%d: args.LeaderCommit is %d\n", rf.me, args.LeaderCommit)
 	if args.LeaderCommit > rf.commitIndex {
@@ -778,6 +797,7 @@ func (rf *Raft) doCandidate() (next int) {
 	DPrintf("%d: doCandidate, currentTerm = %d\n", rf.me, rf.currentTerm)
 	rf.currentTerm++
 	rf.votedFor = rf.me
+	rf.persist()
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
@@ -912,6 +932,7 @@ func (rf *Raft) doLeader() (next int) {
 			i := rf.log_base_index + len(rf.log)
 			reply := PutCmdReply{i, rf.currentTerm, true}
 			rf.log = append(rf.log, LogEntry{rf.currentTerm, req.cmd})
+			rf.persist()
 			rf.mu.Unlock()
 			req.reply <- reply
 			matchIndexes[rf.me] = i
