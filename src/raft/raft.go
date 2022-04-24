@@ -491,7 +491,10 @@ func (rf *Raft) _appendEntries(args *AppendEntriesArgs) bool {
 		i++
 		j++
 	}
-	rf.log = append(rf.log[:i], args.Entries[j:]...)
+	// To avoid the outdated AppendEntries RPC delete the commited log entires
+	if j < len(args.Entries) {
+		rf.log = append(rf.log[:i], args.Entries[j:]...)
+	}
 	// rf.logger.Printf("%d: args.LeaderCommit is %d\n", rf.me, args.LeaderCommit)
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = MinInt(args.LeaderCommit, rf.log_base_index+len(rf.log)-1)
