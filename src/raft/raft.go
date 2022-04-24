@@ -920,7 +920,7 @@ func (rf *Raft) doLeader() (next int) {
 			req <- ServerState{rf.me, rf.currentTerm, true}
 		case req := <-rf.requestVoteCh:
 			req.reply <- rf.handleVoteRequest(req.args)
-			if rf.votedFor == -1 {
+			if rf.votedFor != rf.me {
 				// A newer term. Convert to follower
 				abort()
 				next = StateFollower
