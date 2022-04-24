@@ -936,7 +936,7 @@ func (rf *Raft) doLeader() (next int) {
 			sorted := append(make([]int, 0, len(matchIndexes)), matchIndexes...)
 			sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 			majorityIndex := sorted[len(rf.peers)/2]
-			if majorityIndex > rf.commitIndex {
+			if majorityIndex > rf.commitIndex && rf.log[majorityIndex-rf.log_base_index].Term == rf.currentTerm {
 				rf.mu.Lock()
 				rf.commitIndex = majorityIndex
 				rf.mu.Unlock()
