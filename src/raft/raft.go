@@ -123,10 +123,11 @@ type Raft struct {
 	votedFor    int
 
 	randGen *rand.Rand
-	log     []LogEntry
+	log     []LogEntry // log[0].Term is the term of the last log entry in snapshot
 	// To support log compaction in the future.
 	// Log entries whose indexes are smaller than log_base_index are archived.
-	log_base_index int
+	log_base_index int // Index of log[0]
+	snapshot       []byte
 
 	commitIndex int
 	lastApplied int
@@ -135,6 +136,7 @@ type Raft struct {
 	requestVoteCh     chan VoteReq
 	putCmdCh          chan PutCmdReq
 	appendEntriesChan chan AppendEntriesArgsReply
+	installSnapshotCh chan *InstallSnapshotArgs
 	quit              chan struct{}
 	quit_done         chan struct{}
 }
@@ -155,13 +157,14 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// DPrintf("%d: Persisting currentTerm = %d, votedFor = %d, log_base_index = %d, log = %v\n", rf.me, rf.currentTerm, rf.votedFor, rf.log_base_index, rf.log)
+	DPrintf("%d: Persisting currentTerm = %d, votedFor = %d, log_base_index = %d, log = %v\n", rf.me, rf.currentTerm, rf.votedFor, rf.log_base_index, rf.log)
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log_base_index)
 	e.Encode(rf.log)
+	e.Encode(rf.snapshot)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -181,16 +184,19 @@ func (rf *Raft) readPersist(data []byte) bool {
 	var votedFor int
 	var log_base_index int
 	var log []LogEntry
+	var snapshot []byte
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
 		d.Decode(&log_base_index) != nil ||
-		d.Decode(&log) != nil {
+		d.Decode(&log) != nil ||
+		d.Decode(&snapshot) != nil {
 		return true
 	}
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
 	rf.log_base_index = log_base_index
 	rf.log = log
+	rf.snapshot = snapshot
 	DPrintf("%d: readPersist: currentTerm = %d, votedFor = %d, log_base_index = %d, log = %v\n", rf.me, rf.currentTerm, rf.votedFor, rf.log_base_index, rf.log)
 	return false
 }
@@ -206,13 +212,51 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	return true
 }
 
+type SnapshotArgs struct {
+	Index    int
+	Snapshot []byte
+}
+
+type InstallSnapshotArgs struct {
+	Index    int
+	Snapshot []byte
+	apply    bool
+	done     chan struct{}
+}
+
+func (rf *Raft) InstallSnapshotRaw(args *InstallSnapshotArgs) {
+	DPrintf("%d: InstallSnapshotRaw, index = %d\n", rf.me, args.Index)
+	rf.snapshot = args.Snapshot
+	rf.log = rf.log[args.Index-rf.log_base_index:]
+	rf.log_base_index = args.Index
+	rf.persist()
+	if args.apply {
+		DPrintf("1\n")
+		rf.applyCh <- ApplyMsg{false, nil, 0, true, rf.snapshot, rf.log[0].Term, rf.log_base_index}
+		DPrintf("2\n")
+	}
+}
+
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	DPrintf("%d: Snapshot, index = %d\n", rf.me, index)
+	go func() {
+		rf.installSnapshotCh <- &InstallSnapshotArgs{index, snapshot, false, nil}
+	}()
+}
 
+func (rf *Raft) InstallSnapshot(args *SnapshotArgs, _ *struct{}) {
+	DPrintf("%d: RPC InstallSnapshot, index = %d\n", rf.me, args.Index)
+	done := make(chan struct{})
+	DPrintf("InstallSnapshot 1\n")
+	rf.installSnapshotCh <- &InstallSnapshotArgs{args.Index, args.Snapshot, true, done}
+	DPrintf("InstallSnapshot 2\n")
+	<-done
+	DPrintf("InstallSnapshot 3\n")
 }
 
 //
@@ -344,8 +388,10 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.randGen = rand.New(rand.NewSource(int64(me)))
-	rf.log = make([]LogEntry, 0)
-	rf.log_base_index = 1
+	rf.log = make([]LogEntry, 1)
+	rf.log[0].Term = 0
+	rf.log_base_index = 0
+	rf.snapshot = nil
 
 	rf.lastApplied = 0
 	rf.commitIndex = 0
@@ -354,6 +400,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.requestVoteCh = make(chan VoteReq)
 	rf.putCmdCh = make(chan PutCmdReq)
 	rf.appendEntriesChan = make(chan AppendEntriesArgsReply)
+	rf.installSnapshotCh = make(chan *InstallSnapshotArgs)
 	rf.quit = make(chan struct{})
 	rf.quit_done = make(chan struct{})
 
@@ -376,13 +423,6 @@ func (rf *Raft) LastLogTerm() int {
 		return 0
 	}
 	return rf.log[len(rf.log)-1].Term
-}
-func (rf *Raft) LogTerm(index int) int {
-	if index < rf.log_base_index {
-		return 0
-	}
-	i := index - rf.log_base_index
-	return rf.log[i].Term
 }
 func (rf *Raft) LogUpToDate(args *RequestVoteArgs) bool {
 	if len(rf.log) == 0 {
@@ -431,7 +471,7 @@ func (rf *Raft) handleVoteRequest(args *RequestVoteArgs) (reply RequestVoteReply
 			rf.votedFor = args.CandidateId
 			rf.persist()
 		}
-		DPrintf("granted\n")
+		DPrintf("%d: granted\n", rf.me)
 	} else {
 		DPrintf("%d: Refuse for outdated log\n", rf.me)
 	}
@@ -480,7 +520,8 @@ func (rf *Raft) ApplyCmds() {
 	for rf.lastApplied < rf.commitIndex {
 		rf.lastApplied++
 		cmd := rf.log[rf.lastApplied-rf.log_base_index].Command
-		rf.applyCh <- ApplyMsg{true, cmd, rf.lastApplied, true, nil, 0, 0}
+		DPrintf("%d: %d %d to be applied\n", rf.me, rf.lastApplied, cmd)
+		rf.applyCh <- ApplyMsg{true, cmd, rf.lastApplied, false, nil, 0, 0}
 		DPrintf("%d: %d %d applied\n", rf.me, rf.lastApplied, cmd)
 	}
 }
@@ -492,19 +533,23 @@ func (rf *Raft) appendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-	i := args.PrevLogIndex - rf.log_base_index
 	if args.PrevLogIndex < rf.log_base_index {
-		if args.PrevLogIndex != 0 {
-			// rf.logger.Printf("args.PrevLogIndex = %d\n", args.PrevLogIndex)
-			panic("Log compaction not implemented yet!")
-		}
-	} else {
-		if rf.log[i].Term != args.PrevLogTerm {
-			reply.Success = false
-			// rf.log = rf.log[:i]
-			// rf.persist()
+		// The content in snapshot is all committed and not overridable
+		if args.PrevLogIndex+len(args.Entries) <= rf.log_base_index {
+			reply.Success = true
+			reply.NextIndex = rf.log_base_index + 1
 			return
 		}
+		args.Entries = args.Entries[(rf.log_base_index - args.PrevLogIndex):]
+		args.PrevLogIndex = rf.log_base_index
+		args.PrevLogTerm = rf.log[0].Term
+	}
+	i := args.PrevLogIndex - rf.log_base_index
+	if rf.log[i].Term != args.PrevLogTerm {
+		reply.Success = false
+		// rf.log = rf.log[:i]
+		// rf.persist()
+		return
 	}
 	i++
 	overlap := MinInt(len(rf.log)-i, len(args.Entries))
@@ -516,10 +561,10 @@ func (rf *Raft) appendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		i++
 		j++
 	}
-	// fmt.Printf("%d: rf.log = %v, args.Entries = %v\n", rf.me, rf.log, args.Entries)
+	fmt.Printf("%d: rf.log = %v, args.Entries = %v\n", rf.me, rf.log, args.Entries)
 	// To avoid the outdated AppendEntries RPC delete the commited log entires
 	if j < len(args.Entries) {
-		// fmt.Printf("%d: rf.log[:i] = %v, args.Entries[j:] = %v\n", rf.me, rf.log[:i], args.Entries[j:])
+		fmt.Printf("%d: rf.log[:i] = %v, args.Entries[j:] = %v\n", rf.me, rf.log[:i], args.Entries[j:])
 		rf.log = append(rf.log[:i], args.Entries[j:]...)
 		rf.persist()
 	}
@@ -633,9 +678,22 @@ func (r *Replicator) run() {
 		nextIndexLocal := nextIndex
 		mu.Unlock()
 
-		args.PrevLogIndex = nextIndexLocal - 1
 		r.rf.mu.Lock()
-		args.PrevLogTerm = r.rf.LogTerm(args.PrevLogIndex)
+		if nextIndexLocal <= r.rf.log_base_index {
+			ok := r.rf.peers[r.to].Call("Raft.InstallSnapshot", &SnapshotArgs{r.rf.log_base_index, r.rf.snapshot}, &struct{}{})
+			if !ok {
+				r.rf.mu.Unlock()
+				r.NeedReplicate()
+				return
+			}
+			mu.Lock()
+			nextIndex = r.rf.log_base_index + 1
+			nextIndexLocal = nextIndex
+			mu.Unlock()
+		}
+		args.PrevLogIndex = nextIndexLocal - 1
+		args.PrevLogTerm = r.rf.log[args.PrevLogIndex-r.rf.log_base_index].Term
+
 		args.LeaderCommit = r.rf.commitIndex
 		// It does not affect correctness if we only take reference here.
 		// But it might lead to race condition if it becomes a follower and
@@ -644,7 +702,7 @@ func (r *Replicator) run() {
 		copy(args.Entries, r.rf.log[nextIndexLocal-r.rf.log_base_index:])
 		r.rf.mu.Unlock()
 
-		// DPrintf("%d: Replicating to %d, Term = %d, LeaderCommit = %d, PrevLogIndex = %d, PrevLogTerm = %d, Entries = %v\n", r.me, r.to, args.Term, args.LeaderCommit, args.PrevLogIndex, args.PrevLogTerm, args.Entries)
+		DPrintf("%d: Replicating to %d, Term = %d, LeaderCommit = %d, PrevLogIndex = %d, PrevLogTerm = %d, Entries = %v\n", r.me, r.to, args.Term, args.LeaderCommit, args.PrevLogIndex, args.PrevLogTerm, args.Entries)
 
 		// Use go routine to make sure that replicator could close quickly without being blocked by RPC
 		reply := AppendEntriesReply{}
@@ -681,15 +739,27 @@ func (r *Replicator) run() {
 			return
 		}
 		delta := initialNextIndex - nextIndexLocal
+		mu.Lock()
 		if delta == 0 {
 			nextIndexLocal -= 1
 		} else if nextIndexLocal <= delta {
-			nextIndexLocal = 1
+			nextIndexLocal = 1 // TODO: Make it r.rf.log_base_index + 1
 		} else {
 			nextIndexLocal -= delta
+			if delta > 1 && nextIndexLocal < r.rf.log_base_index {
+				nextIndexLocal = r.rf.log_base_index
+			}
 		}
-		mu.Lock()
-		if nextIndexLocal < nextIndex {
+		if nextIndexLocal < r.rf.log_base_index {
+			ok := r.rf.peers[r.to].Call("Raft.InstallSnapshot", &SnapshotArgs{r.rf.log_base_index, r.rf.snapshot}, &struct{}{})
+			if !ok {
+				mu.Unlock()
+				r.NeedReplicate()
+				return
+			}
+			nextIndex = r.rf.log_base_index + 1
+			r.NeedReplicate()
+		} else if nextIndexLocal < nextIndex {
 			nextIndex = nextIndexLocal
 			DPrintf("Replicator %d of %d: Log inconsistency, decrease nextIndex to %d and retry\n", r.to, r.me, nextIndexLocal)
 			r.NeedReplicate()
@@ -777,6 +847,11 @@ func (rf *Raft) doFollower() (next int) {
 				rf.appendEntries(args, &reply)
 			}
 			req.reply <- reply
+		case args := <-rf.installSnapshotCh:
+			rf.InstallSnapshotRaw(args)
+			if args.done != nil {
+				args.done <- struct{}{}
+			}
 		}
 	}
 }
@@ -840,6 +915,11 @@ func (rf *Raft) doCandidate() (next int) {
 			req.reply <- reply
 			next = StateFollower
 			return
+		case args := <-rf.installSnapshotCh:
+			rf.InstallSnapshotRaw(args)
+			if args.done != nil {
+				args.done <- struct{}{}
+			}
 		case term := <-refused:
 			if rf.currentTerm < term {
 				// New term, convert to follower.
@@ -956,6 +1036,14 @@ func (rf *Raft) doLeader() (next int) {
 				rf.commitIndex = majorityIndex
 				rf.mu.Unlock()
 				rf.ApplyCmds()
+			}
+		case args := <-rf.installSnapshotCh:
+			DPrintf("%d: InstallSnapshotArgs received\n", rf.me)
+			rf.mu.Lock()
+			rf.InstallSnapshotRaw(args)
+			rf.mu.Unlock()
+			if args.done != nil {
+				args.done <- struct{}{}
 			}
 		}
 	}
