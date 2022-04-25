@@ -660,13 +660,15 @@ func (r *Replicator) run() {
 		copy(args.Entries, r.rf.log[nextIndexLocal-r.rf.log_base_index:])
 		r.rf.mu.Unlock()
 
-		DPrintf("%d: Replicating to %d, args = %v\n", r.me, r.to, *args)
+		DPrintf("%d: Replicating to %d, Term = %d, LeaderCommit = %d, PrevLogIndex = %d, PrevLogTerm = %d, Entries = %v\n", r.me, r.to, args.Term, args.LeaderCommit, args.PrevLogIndex, args.PrevLogTerm, args.Entries)
 
 		// Use go routine to make sure that replicator could close quickly without being blocked by RPC
 		reply := AppendEntriesReply{}
 		ok := r.rf.peers[r.to].Call("Raft.AppendEntries", args, &reply)
-		if !ok && len(args.Entries) != 0 {
-			r.NeedReplicate()
+		if !ok {
+			if len(args.Entries) != 0 {
+				r.NeedReplicate()
+			}
 			return
 		}
 		if reply.Success {
