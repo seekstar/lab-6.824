@@ -97,7 +97,8 @@ type AppendEntriesReply struct {
 	// currentTerm, for leader to update itself
 	Term int
 	// true if follower contained entry matching prevLogIndex and prevLogTerm
-	Success bool
+	Success   bool
+	NextIndex int
 }
 
 type AppendEntriesArgsReply struct {
@@ -484,10 +485,12 @@ func (rf *Raft) ApplyCmds() {
 	}
 }
 
-func (rf *Raft) appendEntries(args *AppendEntriesArgs) bool {
+func (rf *Raft) appendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// rf.logger.Printf("%d: _appendEntries\n", rf.me)
+	reply.Term = rf.currentTerm
 	if rf.log_base_index+len(rf.log) <= args.PrevLogIndex {
-		return false
+		reply.Success = false
+		return
 	}
 	i := args.PrevLogIndex - rf.log_base_index
 	if args.PrevLogIndex < rf.log_base_index {
@@ -497,9 +500,10 @@ func (rf *Raft) appendEntries(args *AppendEntriesArgs) bool {
 		}
 	} else {
 		if rf.log[i].Term != args.PrevLogTerm {
-			rf.log = rf.log[:i]
-			rf.persist()
-			return false
+			reply.Success = false
+			// rf.log = rf.log[:i]
+			// rf.persist()
+			return
 		}
 	}
 	i++
@@ -515,7 +519,7 @@ func (rf *Raft) appendEntries(args *AppendEntriesArgs) bool {
 	fmt.Printf("%d: rf.log = %v, args.Entries = %v\n", rf.me, rf.log, args.Entries)
 	// To avoid the outdated AppendEntries RPC delete the commited log entires
 	if j < len(args.Entries) {
-		fmt.Printf("%d: rf.log[i:] = %v, args.Entries[j:] = %v\n", rf.me, rf.log[i:], args.Entries[j:])
+		fmt.Printf("%d: rf.log[:i] = %v, args.Entries[j:] = %v\n", rf.me, rf.log[:i], args.Entries[j:])
 		rf.log = append(rf.log[:i], args.Entries[j:]...)
 		rf.persist()
 	}
@@ -525,7 +529,9 @@ func (rf *Raft) appendEntries(args *AppendEntriesArgs) bool {
 		// rf.logger.Printf("Now commitIndex of %d is %d\n", rf.me, rf.commitIndex)
 	}
 	rf.ApplyCmds()
-	return true
+	reply.Success = true
+	reply.NextIndex = rf.log_base_index + len(rf.log)
+	return
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -650,7 +656,7 @@ func (r *Replicator) run() {
 			return
 		}
 		if reply.Success {
-			nextIndexLocal += len(args.Entries)
+			nextIndexLocal = reply.NextIndex
 			mu.Lock()
 			if nextIndexLocal > nextIndex {
 				nextIndex = nextIndexLocal
@@ -768,17 +774,17 @@ func (rf *Raft) doFollower() (next int) {
 					rf.updateTerm(args.Term)
 				}
 				reply.Term = rf.currentTerm
-				reply.Success = rf.appendEntries(args)
+				rf.appendEntries(args, &reply)
 			}
 			req.reply <- reply
 		}
 	}
 }
 func (rf *Raft) doCandidate() (next int) {
-	DPrintf("%d: doCandidate, currentTerm = %d\n", rf.me, rf.currentTerm)
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.persist()
+	DPrintf("%d: doCandidate, currentTerm = %d\n", rf.me, rf.currentTerm)
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
@@ -823,13 +829,15 @@ func (rf *Raft) doCandidate() (next int) {
 		case req := <-rf.appendEntriesChan:
 			if rf.currentTerm > req.args.Term {
 				// Reject
-				req.reply <- AppendEntriesReply{rf.currentTerm, false}
+				req.reply <- AppendEntriesReply{rf.currentTerm, false, 0}
 				break
 			}
 			// New leader, convert to follower.
 			close(abort)
 			rf.updateTerm(req.args.Term)
-			req.reply <- AppendEntriesReply{rf.currentTerm, rf.appendEntries(req.args)}
+			var reply AppendEntriesReply
+			rf.appendEntries(req.args, &reply)
+			req.reply <- reply
 			next = StateFollower
 			return
 		case term := <-refused:
@@ -856,9 +864,7 @@ func (rf *Raft) doLeader() (next int) {
 	matchIndexes := make([]int, len(rf.peers))
 	matchIndexes[rf.me] = rf.LastLogIndex()
 
-	// Empty log entry
-	rf.log = append(rf.log, LogEntry{rf.currentTerm, nil})
-	rf.persist()
+	// TODO: Insert an empty log entry if no command in this term for a long time
 
 	replicators := make([]*Replicator, 0, len(rf.peers)-1)
 	matchIndexCh := make(chan IntPair)
@@ -924,13 +930,15 @@ func (rf *Raft) doLeader() (next int) {
 		case req := <-rf.appendEntriesChan:
 			if rf.currentTerm > req.args.Term {
 				// Reject
-				req.reply <- AppendEntriesReply{rf.currentTerm, false}
+				req.reply <- AppendEntriesReply{rf.currentTerm, false, 0}
 				break
 			}
 			// New leader, convert to follower.
 			abort()
 			rf.updateTerm(req.args.Term)
-			req.reply <- AppendEntriesReply{rf.currentTerm, rf.appendEntries(req.args)}
+			var reply AppendEntriesReply
+			rf.appendEntries(req.args, &reply)
+			req.reply <- reply
 			next = StateFollower
 			return
 		case matchIndex := <-matchIndexCh:
