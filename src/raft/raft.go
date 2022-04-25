@@ -135,6 +135,7 @@ type Raft struct {
 	putCmdCh          chan PutCmdReq
 	appendEntriesChan chan AppendEntriesArgsReply
 	quit              chan struct{}
+	quit_done         chan struct{}
 }
 
 // return currentTerm and whether this server
@@ -315,7 +316,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	DPrintf("Killing %d\n", rf.me)
 	close(rf.quit)
+	<-rf.quit_done
 }
 
 //
@@ -351,6 +354,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.putCmdCh = make(chan PutCmdReq)
 	rf.appendEntriesChan = make(chan AppendEntriesArgsReply)
 	rf.quit = make(chan struct{})
+	rf.quit_done = make(chan struct{})
 
 	// initialize from state persisted before a crash
 	if rf.readPersist(persister.ReadRaftState()) {
@@ -957,8 +961,10 @@ func (rf *Raft) do(state int) {
 			state = rf.doCandidate()
 		case StateLeader:
 			state = rf.doLeader()
-		case StateQuit:
+		}
+		if state == StateQuit {
 			break
 		}
 	}
+	rf.quit_done <- struct{}{}
 }
