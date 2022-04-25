@@ -656,8 +656,9 @@ func (r *Replicator) run() {
 			return
 		}
 		if reply.Success {
-			nextIndexLocal = reply.NextIndex
 			mu.Lock()
+			// The follower's log might be newer than the leader
+			nextIndexLocal = MaxInt(reply.NextIndex, r.rf.LastLogIndex()+1)
 			if nextIndexLocal > nextIndex {
 				nextIndex = nextIndexLocal
 			}
