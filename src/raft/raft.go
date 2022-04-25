@@ -530,7 +530,7 @@ func (rf *Raft) appendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.ApplyCmds()
 	reply.Success = true
-	reply.NextIndex = rf.log_base_index + len(rf.log)
+	reply.NextIndex = rf.log_base_index + i + len(args.Entries) - j
 	return
 }
 
@@ -656,9 +656,8 @@ func (r *Replicator) run() {
 			return
 		}
 		if reply.Success {
+			nextIndexLocal = reply.NextIndex
 			mu.Lock()
-			// The follower's log might be newer than the leader
-			nextIndexLocal = MinInt(reply.NextIndex, r.rf.LastLogIndex()+1)
 			if nextIndexLocal > nextIndex {
 				nextIndex = nextIndexLocal
 			}
