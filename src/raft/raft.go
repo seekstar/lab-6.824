@@ -155,7 +155,7 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	DPrintf("%d: Persisting currentTerm = %d, votedFor = %d, log_base_index = %d, log = %v\n", rf.me, rf.currentTerm, rf.votedFor, rf.log_base_index, rf.log)
+	// DPrintf("%d: Persisting currentTerm = %d, votedFor = %d, log_base_index = %d, log = %v\n", rf.me, rf.currentTerm, rf.votedFor, rf.log_base_index, rf.log)
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
@@ -516,10 +516,10 @@ func (rf *Raft) appendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		i++
 		j++
 	}
-	fmt.Printf("%d: rf.log = %v, args.Entries = %v\n", rf.me, rf.log, args.Entries)
+	// fmt.Printf("%d: rf.log = %v, args.Entries = %v\n", rf.me, rf.log, args.Entries)
 	// To avoid the outdated AppendEntries RPC delete the commited log entires
 	if j < len(args.Entries) {
-		fmt.Printf("%d: rf.log[:i] = %v, args.Entries[j:] = %v\n", rf.me, rf.log[:i], args.Entries[j:])
+		// fmt.Printf("%d: rf.log[:i] = %v, args.Entries[j:] = %v\n", rf.me, rf.log[:i], args.Entries[j:])
 		rf.log = append(rf.log[:i], args.Entries[j:]...)
 		rf.persist()
 	}
@@ -644,7 +644,7 @@ func (r *Replicator) run() {
 		copy(args.Entries, r.rf.log[nextIndexLocal-r.rf.log_base_index:])
 		r.rf.mu.Unlock()
 
-		DPrintf("%d: Replicating to %d, Term = %d, LeaderCommit = %d, PrevLogIndex = %d, PrevLogTerm = %d, Entries = %v\n", r.me, r.to, args.Term, args.LeaderCommit, args.PrevLogIndex, args.PrevLogTerm, args.Entries)
+		// DPrintf("%d: Replicating to %d, Term = %d, LeaderCommit = %d, PrevLogIndex = %d, PrevLogTerm = %d, Entries = %v\n", r.me, r.to, args.Term, args.LeaderCommit, args.PrevLogIndex, args.PrevLogTerm, args.Entries)
 
 		// Use go routine to make sure that replicator could close quickly without being blocked by RPC
 		reply := AppendEntriesReply{}
