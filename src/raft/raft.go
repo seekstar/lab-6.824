@@ -767,7 +767,11 @@ func (rf *Raft) doFollower() (next int) {
 			DPrintf("%d: I am a follower, currentTerm = %d\n", rf.me, rf.currentTerm)
 			req <- ServerState{rf.me, rf.currentTerm, false}
 		case req := <-rf.requestVoteCh:
-			req.reply <- rf.handleVoteRequest(req.args)
+			reply := rf.handleVoteRequest(req.args)
+			if reply.VoteGranted {
+				good_epoch = true
+			}
+			req.reply <- reply
 		case req := <-rf.putCmdCh:
 			req.reply <- PutCmdReply{-1, -1, false}
 		case req := <-rf.appendEntriesChan:
