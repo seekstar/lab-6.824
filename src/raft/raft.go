@@ -508,9 +508,10 @@ func (rf *Raft) _appendEntries(args *AppendEntriesArgs) bool {
 		i++
 		j++
 	}
+	fmt.Printf("%d: rf.log = %v, args.Entries = %v\n", rf.me, rf.log, args.Entries)
 	// To avoid the outdated AppendEntries RPC delete the commited log entires
 	if j < len(args.Entries) {
-		fmt.Printf("%d: rf.log = %v, args.Entries = %v\n", rf.me, rf.log, args.Entries)
+		fmt.Printf("%d: rf.log[i:] = %v, args.Entries[j:] = %v\n", rf.me, rf.log[i:], args.Entries[j:])
 		rf.log = append(rf.log[:i], args.Entries[j:]...)
 		rf.persist()
 	}
@@ -523,12 +524,14 @@ func (rf *Raft) _appendEntries(args *AppendEntriesArgs) bool {
 	return true
 }
 
-func (rf *Raft) appendEntries(args *AppendEntriesArgs) (reply AppendEntriesReply) {
+func (rf *Raft) appendEntries(args *AppendEntriesArgs, good_epoch *bool) (reply AppendEntriesReply) {
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
+	DPrintf("%d: Good epoch!\n", rf.me)
+	*good_epoch = true
 	if rf.currentTerm < args.Term {
 		rf.updateTerm(args.Term)
 	}
@@ -606,47 +609,81 @@ type Replicator struct {
 	closed     chan struct{}
 }
 
-func (r *Replicator) callAppendEntries(args *AppendEntriesArgs, replyCh chan *AppendEntriesReply) {
-	// fmt.Printf("%d: AppendEntires RPC to %d\n", r.me, r.to)
-	reply := AppendEntriesReply{}
-	ok := r.rf.peers[r.to].Call("Raft.AppendEntries", args, &reply)
-	// fmt.Printf("%d: AppendEntries RPC to %d returns %t\n", r.me, r.to, ok)
-	if ok {
-		select {
-		case <-r.quit:
-		case replyCh <- &reply:
-		}
-	} else {
-		select {
-		case <-r.quit:
-		case replyCh <- nil:
-		}
+func MakeReplicator(rf *Raft, to int, quit chan struct{}, matchIndex chan IntPair, higherTerm chan int, closed chan struct{}) (r *Replicator) {
+	return &Replicator{
+		rf,
+		rf.currentTerm,
+		rf.me,
+		to,
+		make(chan struct{}, 1),
+		quit,
+		matchIndex,
+		higherTerm,
+		closed,
 	}
 }
+
+func (r *Replicator) NeedReplicate() {
+	select {
+	case r.need_replicate <- struct{}{}:
+	default:
+	}
+}
+
 func (r *Replicator) run() {
 	heartbeat := make(chan struct{})
 	go heartbeatTrigger(heartbeat, r.quit)
 
+	var mu sync.Mutex
 	r.rf.mu.Lock()
 	nextIndex := r.rf.LastLogIndex() + 1
 	r.rf.mu.Unlock()
-	matchIndex := 0
+	initialNextIndex := nextIndex
 
-	do_heartbeat := func(nextIndex int) {
+	replicate := func() {
 		args := &AppendEntriesArgs{
 			Term:     r.currentTerm,
 			LeaderId: r.me,
 		}
-		// fmt.Printf("%d: Heartbeat to %d\n", r.me, r.to)
-		args.PrevLogIndex = nextIndex - 1
+		mu.Lock()
+		nextIndexLocal := nextIndex
+		mu.Unlock()
+
+		args.PrevLogIndex = nextIndexLocal - 1
 		r.rf.mu.Lock()
 		args.PrevLogTerm = r.rf.LogTerm(args.PrevLogIndex)
 		args.LeaderCommit = r.rf.commitIndex
-		args.Entries = nil
+		// It does not affect correctness if we only take reference here.
+		// But it might lead to race condition if it becomes a follower and
+		// the log is modified by the new leader while sending the RPC.
+		args.Entries = make([]LogEntry, len(r.rf.log)-(nextIndexLocal-r.rf.log_base_index))
+		copy(args.Entries, r.rf.log[nextIndexLocal-r.rf.log_base_index:])
 		r.rf.mu.Unlock()
+
+		DPrintf("%d: Replicating to %d, args = %v\n", r.me, r.to, *args)
+
+		// Use go routine to make sure that replicator could close quickly without being blocked by RPC
 		reply := AppendEntriesReply{}
 		ok := r.rf.peers[r.to].Call("Raft.AppendEntries", args, &reply)
-		if !ok || reply.Success {
+		if !ok && len(args.Entries) != 0 {
+			r.NeedReplicate()
+			return
+		}
+		if reply.Success {
+			nextIndexLocal += len(args.Entries)
+			mu.Lock()
+			if nextIndexLocal > nextIndex {
+				nextIndex = nextIndexLocal
+			}
+			mu.Unlock()
+
+			matchIndex := nextIndexLocal - 1
+			DPrintf("Replicator %d of %d: matchIndex is %d\n", r.to, r.me, matchIndex)
+			select {
+			case <-r.quit:
+				return
+			case r.matchIndex <- IntPair{r.to, matchIndex}:
+			}
 			return
 		}
 		if reply.Term > r.currentTerm {
@@ -657,75 +694,21 @@ func (r *Replicator) run() {
 			}
 			return
 		}
-		nextIndex--
-		if nextIndex == 0 {
-			panic("nextIndex == 0!")
+		delta := initialNextIndex - nextIndexLocal
+		if delta == 0 {
+			nextIndexLocal -= 1
+		} else if nextIndexLocal <= delta {
+			nextIndexLocal = 1
+		} else {
+			nextIndexLocal -= delta
 		}
-		select {
-		case r.need_replicate <- struct{}{}:
-		default:
+		mu.Lock()
+		if nextIndexLocal < nextIndex {
+			nextIndex = nextIndexLocal
+			DPrintf("Replicator %d of %d: Log inconsistency, decrease nextIndex to %d and retry\n", r.to, r.me, nextIndexLocal)
+			r.NeedReplicate()
 		}
-	}
-
-	replicate := func() {
-		args := &AppendEntriesArgs{
-			Term:     r.currentTerm,
-			LeaderId: r.me,
-		}
-		// fmt.Printf("%d: Replicating to %d\n", r.me, r.to)
-		for {
-			args.PrevLogIndex = nextIndex - 1
-			r.rf.mu.Lock()
-			args.PrevLogTerm = r.rf.LogTerm(args.PrevLogIndex)
-			args.LeaderCommit = r.rf.commitIndex
-			// It does not affect correctness if we only take reference here.
-			// But it might lead to race condition if it becomes a follower and
-			// the log is modified by the new leader while sending the RPC.
-			args.Entries = make([]LogEntry, len(r.rf.log)-(nextIndex-r.rf.log_base_index))
-			copy(args.Entries, r.rf.log[nextIndex-r.rf.log_base_index:])
-			r.rf.mu.Unlock()
-			// r.rf.logger.Printf("%d: nextIndex = %d\n", r.to, nextIndex)
-
-			// Use go routine to make sure that replicator could close quickly without being blocked by RPC
-			replyCh := make(chan *AppendEntriesReply)
-			go r.callAppendEntries(args, replyCh)
-			var reply *AppendEntriesReply
-			select {
-			case <-r.quit:
-				return
-			case reply = <-replyCh:
-			}
-			if reply == nil {
-				// Retry
-				continue
-			}
-			if reply.Success {
-				nextIndex += len(args.Entries)
-				if nextIndex-1 > matchIndex {
-					matchIndex = nextIndex - 1
-					DPrintf("Replicator %d of %d: Updating matchIndex to %d\n", r.to, r.me, matchIndex)
-					select {
-					case <-r.quit:
-						return
-					case r.matchIndex <- IntPair{r.to, matchIndex}:
-					}
-				}
-				return
-			}
-			if reply.Term > r.currentTerm {
-				// Discovers server with higher term.
-				select {
-				case <-r.quit:
-				case r.higherTerm <- reply.Term:
-				}
-				return
-			}
-			nextIndex--
-			if nextIndex == 0 {
-				panic("nextIndex == 0!")
-			}
-			// r.rf.logger.Printf("Replicator %d of %d: Log inconsistency, decrease nextIndex to %d and retry\n", r.to, r.me, nextIndex)
-		}
+		mu.Unlock()
 	}
 
 	sent := false
@@ -741,10 +724,10 @@ func (r *Replicator) run() {
 				break
 			}
 			// Use go routine to make sure that the heartbeats are sent periodically even when the RPC call does not return.
-			go do_heartbeat(nextIndex)
+			go replicate()
 		case <-r.need_replicate:
 			sent = true
-			replicate()
+			go replicate()
 		}
 	}
 }
@@ -781,15 +764,15 @@ func (rf *Raft) doFollower() (next int) {
 			next = StateCandidate
 			return
 		case req := <-rf.getStateCh:
-			// fmt.Printf("%d: I am a follower, currentTerm = %d\n", rf.me, rf.currentTerm)
+			DPrintf("%d: I am a follower, currentTerm = %d\n", rf.me, rf.currentTerm)
 			req <- ServerState{rf.me, rf.currentTerm, false}
 		case req := <-rf.requestVoteCh:
 			req.reply <- rf.handleVoteRequest(req.args)
 		case req := <-rf.putCmdCh:
 			req.reply <- PutCmdReply{-1, -1, false}
 		case req := <-rf.appendEntriesChan:
-			good_epoch = true
-			req.reply <- rf.appendEntries(req.args)
+			DPrintf("%d: Message received from Leader %d\n", rf.me, req.args.LeaderId)
+			req.reply <- rf.appendEntries(req.args, &good_epoch)
 		}
 	}
 }
@@ -877,7 +860,11 @@ func (rf *Raft) doLeader() (next int) {
 	matchIndexes := make([]int, len(rf.peers))
 	matchIndexes[rf.me] = rf.LastLogIndex()
 
-	logGrowChs := make([]chan struct{}, 0, len(rf.peers)-1)
+	// Empty log entry
+	rf.log = append(rf.log, LogEntry{rf.currentTerm, nil})
+	rf.persist()
+
+	replicators := make([]*Replicator, 0, len(rf.peers)-1)
 	matchIndexCh := make(chan IntPair)
 	quit := make(chan struct{})
 	higherTerm := make(chan int)
@@ -886,10 +873,9 @@ func (rf *Raft) doLeader() (next int) {
 		if i == rf.me {
 			continue
 		}
-		logGrowCh := make(chan struct{}, 1)
-		logGrowChs = append(logGrowChs, logGrowCh)
-		r := &Replicator{rf, rf.currentTerm, rf.me, i, logGrowCh, quit, matchIndexCh, higherTerm, closed}
+		r := MakeReplicator(rf, i, quit, matchIndexCh, higherTerm, closed)
 		go r.run()
+		replicators = append(replicators, r)
 	}
 	abort := func() {
 		DPrintf("%d: Leader aborting\n", rf.me)
@@ -936,11 +922,8 @@ func (rf *Raft) doLeader() (next int) {
 			rf.mu.Unlock()
 			req.reply <- reply
 			matchIndexes[rf.me] = i
-			for _, ch := range logGrowChs {
-				select {
-				case ch <- struct{}{}:
-				default:
-				}
+			for _, r := range replicators {
+				r.NeedReplicate()
 			}
 		case req := <-rf.appendEntriesChan:
 			if rf.currentTerm > req.args.Term {
@@ -956,8 +939,9 @@ func (rf *Raft) doLeader() (next int) {
 			return
 		case matchIndex := <-matchIndexCh:
 			if matchIndexes[matchIndex.first] >= matchIndex.second {
-				panic(fmt.Sprintf("matchIndex of %d does not increase monotonically: From %d to %d\n", matchIndex.first, matchIndexes[matchIndex.first], matchIndex.second))
+				break
 			}
+			DPrintf("%d: Updating matchIndex of %d to %d\n", rf.me, matchIndex.first, matchIndex.second)
 			// It could be further optimized. But I am lazy.
 			matchIndexes[matchIndex.first] = matchIndex.second
 			sorted := append(make([]int, 0, len(matchIndexes)), matchIndexes...)
