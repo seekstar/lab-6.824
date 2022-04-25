@@ -480,7 +480,7 @@ func (rf *Raft) ApplyCmds() {
 	}
 }
 
-func (rf *Raft) _appendEntries(args *AppendEntriesArgs) bool {
+func (rf *Raft) appendEntries(args *AppendEntriesArgs) bool {
 	// rf.logger.Printf("%d: _appendEntries\n", rf.me)
 	if rf.log_base_index+len(rf.log) <= args.PrevLogIndex {
 		return false
@@ -524,22 +524,6 @@ func (rf *Raft) _appendEntries(args *AppendEntriesArgs) bool {
 	return true
 }
 
-func (rf *Raft) appendEntries(args *AppendEntriesArgs, good_epoch *bool) (reply AppendEntriesReply) {
-	if rf.currentTerm > args.Term {
-		reply.Term = rf.currentTerm
-		reply.Success = false
-		return
-	}
-	DPrintf("%d: Good epoch!\n", rf.me)
-	*good_epoch = true
-	if rf.currentTerm < args.Term {
-		rf.updateTerm(args.Term)
-	}
-	reply.Term = rf.currentTerm
-	reply.Success = rf._appendEntries(args)
-	return
-}
-
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// fmt.Printf("%d: AppendEntries from %d request received\n", rf.me, args.LeaderId)
 	replyChan := make(chan AppendEntriesReply)
@@ -569,24 +553,14 @@ func (rf *Raft) genRandElectionTimeout() time.Duration {
 	return time.Duration(ret)
 }
 
-func (rf *Raft) electionEpochOnce(electionEpochFire chan struct{}, quit chan struct{}) {
-	time.Sleep(rf.genRandElectionTimeout())
-	select {
-	case <-quit:
-		return
-	case electionEpochFire <- struct{}{}:
-	}
-}
-
-// Use epoch style to save time.
-// So the election timeout is actually [3, 10) hearbeat intervals
-func (rf *Raft) electionEpochTrigger(electionEpochFire chan struct{}, cont chan struct{}, quit chan struct{}) {
+func (rf *Raft) electionTrigger(electionFire chan struct{}, refresh chan struct{}, quit chan struct{}) {
 	for {
-		rf.electionEpochOnce(electionEpochFire, quit)
 		select {
+		case <-time.After(rf.genRandElectionTimeout()):
+			electionFire <- struct{}{}
+		case <-refresh:
 		case <-quit:
 			return
-		case <-cont:
 		}
 	}
 }
@@ -743,11 +717,16 @@ const (
 
 func (rf *Raft) doFollower() (next int) {
 	DPrintf("%d: doFollower, currentTerm = %d\n", rf.me, rf.currentTerm)
-	good_epoch := false
-	electionEpochFire := make(chan struct{})
-	cont := make(chan struct{}) // Continue
+	electionFire := make(chan struct{})
+	refreshCh := make(chan struct{}, 1)
 	quit := make(chan struct{})
-	go rf.electionEpochTrigger(electionEpochFire, cont, quit)
+	go rf.electionTrigger(electionFire, refreshCh, quit)
+	refresh := func() {
+		select {
+		case refreshCh <- struct{}{}:
+		default:
+		}
+	}
 	for {
 		DPrintf("%d(Follower): Listening\n", rf.me)
 		select {
@@ -755,12 +734,7 @@ func (rf *Raft) doFollower() (next int) {
 			close(quit)
 			next = StateQuit
 			return
-		case <-electionEpochFire:
-			if good_epoch {
-				good_epoch = false
-				cont <- struct{}{}
-				break
-			}
+		case <-electionFire:
 			// Time out, starts election
 			close(quit)
 			next = StateCandidate
@@ -771,14 +745,28 @@ func (rf *Raft) doFollower() (next int) {
 		case req := <-rf.requestVoteCh:
 			reply := rf.handleVoteRequest(req.args)
 			if reply.VoteGranted {
-				good_epoch = true
+				refresh()
 			}
 			req.reply <- reply
 		case req := <-rf.putCmdCh:
 			req.reply <- PutCmdReply{-1, -1, false}
 		case req := <-rf.appendEntriesChan:
-			DPrintf("%d: Message received from Leader %d\n", rf.me, req.args.LeaderId)
-			req.reply <- rf.appendEntries(req.args, &good_epoch)
+			args := req.args
+			DPrintf("%d: Message received from Leader %d\n", rf.me, args.LeaderId)
+			var reply AppendEntriesReply
+			if rf.currentTerm > args.Term {
+				reply.Term = rf.currentTerm
+				reply.Success = false
+			} else {
+				DPrintf("%d: Refresh election timer\n", rf.me)
+				refresh()
+				if rf.currentTerm < args.Term {
+					rf.updateTerm(args.Term)
+				}
+				reply.Term = rf.currentTerm
+				reply.Success = rf.appendEntries(args)
+			}
+			req.reply <- reply
 		}
 	}
 }
@@ -804,8 +792,6 @@ func (rf *Raft) doCandidate() (next int) {
 	}
 	grantedCnt := 1
 
-	electionEpochFire := make(chan struct{})
-	go rf.electionEpochOnce(electionEpochFire, abort)
 	for {
 		DPrintf("%d(Candidate): Listening\n", rf.me)
 		select {
@@ -813,12 +799,12 @@ func (rf *Raft) doCandidate() (next int) {
 			close(abort)
 			next = StateQuit
 			return
-		case <-electionEpochFire: // Time out, new election
+		case <-time.After(rf.genRandElectionTimeout()): // Time out, new election
 			close(abort)
 			next = StateCandidate
 			return
 		case req := <-rf.getStateCh:
-			// fmt.Printf("%d: I am a candidate, currentTerm = %d\n", rf.me, rf.currentTerm)
+			DPrintf("%d: I am a candidate, currentTerm = %d\n", rf.me, rf.currentTerm)
 			req <- ServerState{rf.me, rf.currentTerm, false}
 		case req := <-rf.requestVoteCh:
 			req.reply <- rf.handleVoteRequest(req.args)
@@ -839,7 +825,7 @@ func (rf *Raft) doCandidate() (next int) {
 			// New leader, convert to follower.
 			close(abort)
 			rf.updateTerm(req.args.Term)
-			req.reply <- AppendEntriesReply{rf.currentTerm, rf._appendEntries(req.args)}
+			req.reply <- AppendEntriesReply{rf.currentTerm, rf.appendEntries(req.args)}
 			next = StateFollower
 			return
 		case term := <-refused:
@@ -908,7 +894,7 @@ func (rf *Raft) doLeader() (next int) {
 			next = StateFollower
 			return
 		case req := <-rf.getStateCh:
-			// fmt.Printf("%d: I am the leader, currentTerm = %d\n", rf.me, rf.currentTerm)
+			DPrintf("%d: I am the leader, currentTerm = %d\n", rf.me, rf.currentTerm)
 			req <- ServerState{rf.me, rf.currentTerm, true}
 		case req := <-rf.requestVoteCh:
 			req.reply <- rf.handleVoteRequest(req.args)
@@ -940,7 +926,7 @@ func (rf *Raft) doLeader() (next int) {
 			// New leader, convert to follower.
 			abort()
 			rf.updateTerm(req.args.Term)
-			req.reply <- AppendEntriesReply{rf.currentTerm, rf._appendEntries(req.args)}
+			req.reply <- AppendEntriesReply{rf.currentTerm, rf.appendEntries(req.args)}
 			next = StateFollower
 			return
 		case matchIndex := <-matchIndexCh:
