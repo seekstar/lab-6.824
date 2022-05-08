@@ -165,33 +165,29 @@ func (rf *Raft) persist() {
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log_base_index)
 	e.Encode(rf.log)
-	e.Encode(rf.snapshot)
-	data := w.Bytes()
-	DPrintf("%d bytes in total\n", len(data))
-	rf.persister.SaveRaftState(data)
+	state := w.Bytes()
+	rf.persister.SaveStateAndSnapshot(state, rf.snapshot)
 }
 
 //
 // restore previously persisted state.
 //
 // Return false if succeed, true if fail
-func (rf *Raft) readPersist(data []byte) bool {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+func (rf *Raft) readPersist(state []byte, snapshot []byte) bool {
+	if state == nil || len(state) < 1 { // bootstrap without any state?
 		return false
 	}
 	// Your code here (2C).
-	r := bytes.NewBuffer(data)
+	r := bytes.NewBuffer(state)
 	d := labgob.NewDecoder(r)
 	var currentTerm int
 	var votedFor int
 	var log_base_index int
 	var log []LogEntry
-	var snapshot []byte
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
 		d.Decode(&log_base_index) != nil ||
-		d.Decode(&log) != nil ||
-		d.Decode(&snapshot) != nil {
+		d.Decode(&log) != nil {
 		return true
 	}
 	rf.currentTerm = currentTerm
@@ -416,7 +412,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.quit_done = make(chan struct{})
 
 	// initialize from state persisted before a crash
-	if rf.readPersist(persister.ReadRaftState()) {
+	if rf.readPersist(persister.ReadRaftState(), persister.ReadSnapshot()) {
 		fmt.Printf("%d: Fail to read persistend data!\n", rf.me)
 		return nil
 	}
