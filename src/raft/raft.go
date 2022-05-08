@@ -211,6 +211,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 }
 
 type SnapshotArgs struct {
+	Term     int
 	Index    int
 	Snapshot []byte
 }
@@ -224,21 +225,25 @@ type InstallSnapshotChItem struct {
 }
 
 func (rf *Raft) InstallSnapshotRaw(args *InstallSnapshotChItem) {
-	DPrintf("%d: InstallSnapshotRaw, index = %d\n", rf.me, args.snapshot.Index)
+	snapshot := args.snapshot
+	DPrintf("%d: InstallSnapshotRaw, index = %d\n", rf.me, snapshot.Index)
 	if args.snapshot.Index <= rf.log_base_index {
-		DPrintf("An old snapshot\n")
+		DPrintf("%d: An old snapshot\n", rf.me)
+		args.reply <- struct{}{}
 		return
 	}
-	rf.snapshot = args.snapshot.Snapshot
-	rf.log = rf.log[args.snapshot.Index-rf.log_base_index:]
-	rf.log_base_index = args.snapshot.Index
-	rf.commitIndex = MaxInt(rf.commitIndex, args.snapshot.Index)
-	rf.lastApplied = MaxInt(rf.lastApplied, args.snapshot.Index)
+	rf.snapshot = snapshot.Snapshot
+	if snapshot.Index-rf.log_base_index < len(rf.log) {
+		rf.log = rf.log[snapshot.Index-rf.log_base_index:]
+	} else {
+		rf.log = []LogEntry{{Term: snapshot.Term}}
+	}
+	rf.log_base_index = snapshot.Index
+	rf.commitIndex = MaxInt(rf.commitIndex, snapshot.Index)
+	rf.lastApplied = MaxInt(rf.lastApplied, snapshot.Index)
 	rf.persist()
 	if args.apply {
-		DPrintf("1\n")
 		rf.applySnapshotCh <- &ApplyMsg{false, nil, 0, true, rf.snapshot, rf.log[0].Term, rf.log_base_index}
-		DPrintf("2\n")
 	}
 	args.reply <- struct{}{}
 }
@@ -251,18 +256,25 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	DPrintf("%d: Snapshot, index = %d\n", rf.me, index)
 	reply := make(chan struct{})
-	rf.installSnapshotCh <- &InstallSnapshotChItem{&SnapshotArgs{index, snapshot}, false, reply}
+	rf.installSnapshotCh <- &InstallSnapshotChItem{
+		&SnapshotArgs{
+			0, // Won't be required
+			index,
+			snapshot,
+		},
+		false,
+		reply,
+	}
+	DPrintf("%d: Snapshot function waiting for reply of %d\n", rf.me, index)
 	<-reply
+	DPrintf("%d: Snapshot function for %d returns\n", rf.me, index)
 }
 
 func (rf *Raft) InstallSnapshot(args *SnapshotArgs, _ *struct{}) {
 	DPrintf("%d: RPC InstallSnapshot, index = %d\n", rf.me, args.Index)
-	done := make(chan struct{})
-	DPrintf("InstallSnapshot 1\n")
-	rf.installSnapshotCh <- &InstallSnapshotChItem{args, true, done}
-	DPrintf("InstallSnapshot 2\n")
-	<-done
-	DPrintf("InstallSnapshot 3\n")
+	reply := make(chan struct{})
+	rf.installSnapshotCh <- &InstallSnapshotChItem{args, true, reply}
+	<-reply
 }
 
 //
@@ -393,13 +405,9 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.randGen = rand.New(rand.NewSource(int64(me)))
-	rf.log = make([]LogEntry, 1)
-	rf.log[0].Term = 0
+	rf.log = []LogEntry{{Term: 0}}
 	rf.log_base_index = 0
 	rf.snapshot = nil
-
-	rf.lastApplied = 0
-	rf.commitIndex = 0
 
 	rf.getStateCh = make(chan chan ServerState)
 	rf.requestVoteCh = make(chan VoteReq)
@@ -416,6 +424,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 		fmt.Printf("%d: Fail to read persistend data!\n", rf.me)
 		return nil
 	}
+	rf.lastApplied = rf.log_base_index
+	rf.commitIndex = rf.log_base_index
 
 	go rf.Applier(applyCh)
 	go rf.do(StateFollower)
@@ -529,13 +539,17 @@ func (rf *Raft) Applier(applyCh chan ApplyMsg) {
 	var snapshot *ApplyMsg = nil
 	update_snapshot := func(msg *ApplyMsg) {
 		if snapshot == nil || msg.SnapshotIndex > snapshot.SnapshotIndex {
+			DPrintf("%d: Applier: Snapshot %d to be applied\n", rf.me, msg.SnapshotIndex)
 			snapshot = msg
 		}
 	}
 	for {
 		if len(msgs) == 0 && snapshot == nil {
 			select {
+			case <-rf.quit:
+				return
 			case msg := <-rf.applyEntryCh:
+				DPrintf("%d: Applier: %d %v to be applied\n", rf.me, msg.CommandIndex, msg.Command)
 				msgs = append(msgs, msg)
 			case msg := <-rf.applySnapshotCh:
 				update_snapshot(msg)
@@ -543,21 +557,30 @@ func (rf *Raft) Applier(applyCh chan ApplyMsg) {
 		}
 		if snapshot != nil {
 			for len(msgs) != 0 && msgs[0].CommandIndex <= snapshot.SnapshotIndex {
+				DPrintf("%d: Applier: %d %v canceled\n", rf.me, msgs[0].CommandIndex, msgs[0].Command)
 				msgs = msgs[1:]
 			}
 			select {
+			case <-rf.quit:
+				return
 			case applyCh <- *snapshot:
+				DPrintf("%d: Applier: Snapshot %d applied\n", rf.me, snapshot.SnapshotIndex)
 				snapshot = nil
 			case msg := <-rf.applyEntryCh:
+				DPrintf("%d: Applier: %d %v to be applied\n", rf.me, msg.CommandIndex, msg.Command)
 				msgs = append(msgs, msg)
 			case msg := <-rf.applySnapshotCh:
 				update_snapshot(msg)
 			}
 		} else {
 			select {
+			case <-rf.quit:
+				return
 			case applyCh <- *msgs[0]:
+				DPrintf("%d: Applier: %d %v applied\n", rf.me, msgs[0].CommandIndex, msgs[0].Command)
 				msgs = msgs[1:]
 			case msg := <-rf.applyEntryCh:
+				DPrintf("%d: Applier: %d %v to be applied\n", rf.me, msg.CommandIndex, msg.Command)
 				msgs = append(msgs, msg)
 			case msg := <-rf.applySnapshotCh:
 				update_snapshot(msg)
@@ -569,6 +592,7 @@ func (rf *Raft) Applier(applyCh chan ApplyMsg) {
 func (rf *Raft) ApplyCmds() {
 	for rf.lastApplied < rf.commitIndex {
 		rf.lastApplied++
+		fmt.Printf("%d: ApplyCmds: log = %v, rf.lastApplied = %d, rf.log_base_index = %d\n", rf.me, rf.log, rf.lastApplied, rf.log_base_index)
 		cmd := rf.log[rf.lastApplied-rf.log_base_index].Command
 		rf.applyEntryCh <- &ApplyMsg{true, cmd, rf.lastApplied, false, nil, 0, 0}
 	}
@@ -728,10 +752,19 @@ func (r *Replicator) run() {
 
 		r.rf.mu.Lock()
 		if nextIndexLocal <= r.rf.log_base_index {
+			snapshot_last_term_local := r.rf.log[0].Term
 			log_base_index_local := r.rf.log_base_index
 			snapshot_local := r.rf.snapshot
 			r.rf.mu.Unlock()
-			ok := r.rf.peers[r.to].Call("Raft.InstallSnapshot", &SnapshotArgs{log_base_index_local, snapshot_local}, &struct{}{})
+			ok := r.rf.peers[r.to].Call(
+				"Raft.InstallSnapshot",
+				&SnapshotArgs{
+					snapshot_last_term_local,
+					log_base_index_local,
+					snapshot_local,
+				},
+				&struct{}{},
+			)
 			if ok {
 				mu.Lock()
 				nextIndex = log_base_index_local + 1
