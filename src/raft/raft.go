@@ -114,7 +114,6 @@ type Raft struct {
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
-	applyCh   chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -136,7 +135,9 @@ type Raft struct {
 	requestVoteCh     chan VoteReq
 	putCmdCh          chan PutCmdReq
 	appendEntriesChan chan AppendEntriesArgsReply
-	installSnapshotCh chan *InstallSnapshotArgs
+	installSnapshotCh chan *InstallSnapshotChItem
+	applyEntryCh      chan *ApplyMsg // non-block
+	applySnapshotCh   chan *ApplyMsg // non-block
 	quit              chan struct{}
 	quit_done         chan struct{}
 }
@@ -166,6 +167,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.log)
 	e.Encode(rf.snapshot)
 	data := w.Bytes()
+	DPrintf("%d bytes in total\n", len(data))
 	rf.persister.SaveRaftState(data)
 }
 
@@ -217,24 +219,32 @@ type SnapshotArgs struct {
 	Snapshot []byte
 }
 
-type InstallSnapshotArgs struct {
-	Index    int
-	Snapshot []byte
+// Installing snapshot should never be rejected,
+// because the snapshot is always committed.
+type InstallSnapshotChItem struct {
+	snapshot *SnapshotArgs
 	apply    bool
-	done     chan struct{}
+	reply    chan struct{}
 }
 
-func (rf *Raft) InstallSnapshotRaw(args *InstallSnapshotArgs) {
-	DPrintf("%d: InstallSnapshotRaw, index = %d\n", rf.me, args.Index)
-	rf.snapshot = args.Snapshot
-	rf.log = rf.log[args.Index-rf.log_base_index:]
-	rf.log_base_index = args.Index
+func (rf *Raft) InstallSnapshotRaw(args *InstallSnapshotChItem) {
+	DPrintf("%d: InstallSnapshotRaw, index = %d\n", rf.me, args.snapshot.Index)
+	if args.snapshot.Index <= rf.log_base_index {
+		DPrintf("An old snapshot\n")
+		return
+	}
+	rf.snapshot = args.snapshot.Snapshot
+	rf.log = rf.log[args.snapshot.Index-rf.log_base_index:]
+	rf.log_base_index = args.snapshot.Index
+	rf.commitIndex = MaxInt(rf.commitIndex, args.snapshot.Index)
+	rf.lastApplied = MaxInt(rf.lastApplied, args.snapshot.Index)
 	rf.persist()
 	if args.apply {
 		DPrintf("1\n")
-		rf.applyCh <- ApplyMsg{false, nil, 0, true, rf.snapshot, rf.log[0].Term, rf.log_base_index}
+		rf.applySnapshotCh <- &ApplyMsg{false, nil, 0, true, rf.snapshot, rf.log[0].Term, rf.log_base_index}
 		DPrintf("2\n")
 	}
+	args.reply <- struct{}{}
 }
 
 // the service says it has created a snapshot that has
@@ -244,16 +254,16 @@ func (rf *Raft) InstallSnapshotRaw(args *InstallSnapshotArgs) {
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	DPrintf("%d: Snapshot, index = %d\n", rf.me, index)
-	go func() {
-		rf.installSnapshotCh <- &InstallSnapshotArgs{index, snapshot, false, nil}
-	}()
+	reply := make(chan struct{})
+	rf.installSnapshotCh <- &InstallSnapshotChItem{&SnapshotArgs{index, snapshot}, false, reply}
+	<-reply
 }
 
 func (rf *Raft) InstallSnapshot(args *SnapshotArgs, _ *struct{}) {
 	DPrintf("%d: RPC InstallSnapshot, index = %d\n", rf.me, args.Index)
 	done := make(chan struct{})
 	DPrintf("InstallSnapshot 1\n")
-	rf.installSnapshotCh <- &InstallSnapshotArgs{args.Index, args.Snapshot, true, done}
+	rf.installSnapshotCh <- &InstallSnapshotChItem{args, true, done}
 	DPrintf("InstallSnapshot 2\n")
 	<-done
 	DPrintf("InstallSnapshot 3\n")
@@ -382,7 +392,6 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
@@ -400,7 +409,9 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.requestVoteCh = make(chan VoteReq)
 	rf.putCmdCh = make(chan PutCmdReq)
 	rf.appendEntriesChan = make(chan AppendEntriesArgsReply)
-	rf.installSnapshotCh = make(chan *InstallSnapshotArgs)
+	rf.installSnapshotCh = make(chan *InstallSnapshotChItem)
+	rf.applyEntryCh = make(chan *ApplyMsg)
+	rf.applySnapshotCh = make(chan *ApplyMsg)
 	rf.quit = make(chan struct{})
 	rf.quit_done = make(chan struct{})
 
@@ -410,6 +421,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 		return nil
 	}
 
+	go rf.Applier(applyCh)
 	go rf.do(StateFollower)
 
 	return rf
@@ -516,13 +528,53 @@ func MaxInt(a int, b int) int {
 	}
 }
 
+func (rf *Raft) Applier(applyCh chan ApplyMsg) {
+	var msgs []*ApplyMsg
+	var snapshot *ApplyMsg = nil
+	update_snapshot := func(msg *ApplyMsg) {
+		if snapshot == nil || msg.SnapshotIndex > snapshot.SnapshotIndex {
+			snapshot = msg
+		}
+	}
+	for {
+		if len(msgs) == 0 && snapshot == nil {
+			select {
+			case msg := <-rf.applyEntryCh:
+				msgs = append(msgs, msg)
+			case msg := <-rf.applySnapshotCh:
+				update_snapshot(msg)
+			}
+		}
+		if snapshot != nil {
+			for len(msgs) != 0 && msgs[0].CommandIndex <= snapshot.SnapshotIndex {
+				msgs = msgs[1:]
+			}
+			select {
+			case applyCh <- *snapshot:
+				snapshot = nil
+			case msg := <-rf.applyEntryCh:
+				msgs = append(msgs, msg)
+			case msg := <-rf.applySnapshotCh:
+				update_snapshot(msg)
+			}
+		} else {
+			select {
+			case applyCh <- *msgs[0]:
+				msgs = msgs[1:]
+			case msg := <-rf.applyEntryCh:
+				msgs = append(msgs, msg)
+			case msg := <-rf.applySnapshotCh:
+				update_snapshot(msg)
+			}
+		}
+	}
+}
+
 func (rf *Raft) ApplyCmds() {
 	for rf.lastApplied < rf.commitIndex {
 		rf.lastApplied++
 		cmd := rf.log[rf.lastApplied-rf.log_base_index].Command
-		DPrintf("%d: %d %d to be applied\n", rf.me, rf.lastApplied, cmd)
-		rf.applyCh <- ApplyMsg{true, cmd, rf.lastApplied, false, nil, 0, 0}
-		DPrintf("%d: %d %d applied\n", rf.me, rf.lastApplied, cmd)
+		rf.applyEntryCh <- &ApplyMsg{true, cmd, rf.lastApplied, false, nil, 0, 0}
 	}
 }
 
@@ -561,10 +613,10 @@ func (rf *Raft) appendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		i++
 		j++
 	}
-	fmt.Printf("%d: rf.log = %v, args.Entries = %v\n", rf.me, rf.log, args.Entries)
+	// fmt.Printf("%d: rf.log = %v, args.Entries = %v\n", rf.me, rf.log, args.Entries)
 	// To avoid the outdated AppendEntries RPC delete the commited log entires
 	if j < len(args.Entries) {
-		fmt.Printf("%d: rf.log[:i] = %v, args.Entries[j:] = %v\n", rf.me, rf.log[:i], args.Entries[j:])
+		// fmt.Printf("%d: rf.log[:i] = %v, args.Entries[j:] = %v\n", rf.me, rf.log[:i], args.Entries[j:])
 		rf.log = append(rf.log[:i], args.Entries[j:]...)
 		rf.persist()
 	}
@@ -849,9 +901,6 @@ func (rf *Raft) doFollower() (next int) {
 			req.reply <- reply
 		case args := <-rf.installSnapshotCh:
 			rf.InstallSnapshotRaw(args)
-			if args.done != nil {
-				args.done <- struct{}{}
-			}
 		}
 	}
 }
@@ -919,9 +968,6 @@ func (rf *Raft) doCandidate() (next int) {
 			return
 		case args := <-rf.installSnapshotCh:
 			rf.InstallSnapshotRaw(args)
-			if args.done != nil {
-				args.done <- struct{}{}
-			}
 		case term := <-refused:
 			if rf.currentTerm < term {
 				// New term, convert to follower.
@@ -1036,17 +1082,14 @@ func (rf *Raft) doLeader() (next int) {
 			if majorityIndex > rf.commitIndex && rf.log[majorityIndex-rf.log_base_index].Term == rf.currentTerm {
 				rf.mu.Lock()
 				rf.commitIndex = majorityIndex
-				rf.mu.Unlock()
 				rf.ApplyCmds()
+				rf.mu.Unlock()
 			}
 		case args := <-rf.installSnapshotCh:
 			DPrintf("%d: InstallSnapshotArgs received\n", rf.me)
 			rf.mu.Lock()
 			rf.InstallSnapshotRaw(args)
 			rf.mu.Unlock()
-			if args.done != nil {
-				args.done <- struct{}{}
-			}
 		}
 	}
 }
