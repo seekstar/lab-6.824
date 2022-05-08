@@ -877,6 +877,8 @@ func (rf *Raft) doCandidate() (next int) {
 	}
 	grantedCnt := 1
 
+	electionFire := time.After(rf.genRandElectionTimeout())
+
 	for {
 		DPrintf("%d(Candidate): Listening\n", rf.me)
 		select {
@@ -884,7 +886,7 @@ func (rf *Raft) doCandidate() (next int) {
 			close(abort)
 			next = StateQuit
 			return
-		case <-time.After(rf.genRandElectionTimeout()): // Time out, new election
+		case <-electionFire:
 			close(abort)
 			next = StateCandidate
 			return
