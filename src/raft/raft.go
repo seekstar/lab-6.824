@@ -732,16 +732,18 @@ func (r *Replicator) run() {
 
 		r.rf.mu.Lock()
 		if nextIndexLocal <= r.rf.log_base_index {
-			ok := r.rf.peers[r.to].Call("Raft.InstallSnapshot", &SnapshotArgs{r.rf.log_base_index, r.rf.snapshot}, &struct{}{})
-			if !ok {
-				r.rf.mu.Unlock()
-				r.NeedReplicate()
-				return
+			log_base_index_local := r.rf.log_base_index
+			snapshot_local := r.rf.snapshot
+			r.rf.mu.Unlock()
+			ok := r.rf.peers[r.to].Call("Raft.InstallSnapshot", &SnapshotArgs{log_base_index_local, snapshot_local}, &struct{}{})
+			if ok {
+				mu.Lock()
+				nextIndex = log_base_index_local + 1
+				mu.Unlock()
 			}
-			mu.Lock()
-			nextIndex = r.rf.log_base_index + 1
-			nextIndexLocal = nextIndex
-			mu.Unlock()
+			// retry
+			r.NeedReplicate()
+			return
 		}
 		args.PrevLogIndex = nextIndexLocal - 1
 		args.PrevLogTerm = r.rf.log[args.PrevLogIndex-r.rf.log_base_index].Term
@@ -791,32 +793,19 @@ func (r *Replicator) run() {
 			return
 		}
 		delta := initialNextIndex - nextIndexLocal
-		mu.Lock()
 		if delta == 0 {
 			nextIndexLocal -= 1
 		} else if nextIndexLocal <= delta {
-			nextIndexLocal = 1 // TODO: Make it r.rf.log_base_index + 1
+			// To reduce unnecessary InstallSnapshot RPC
+			nextIndexLocal = 1
 		} else {
 			nextIndexLocal -= delta
-			if delta > 1 && nextIndexLocal < r.rf.log_base_index {
-				nextIndexLocal = r.rf.log_base_index
-			}
 		}
-		if nextIndexLocal < r.rf.log_base_index {
-			ok := r.rf.peers[r.to].Call("Raft.InstallSnapshot", &SnapshotArgs{r.rf.log_base_index, r.rf.snapshot}, &struct{}{})
-			if !ok {
-				mu.Unlock()
-				r.NeedReplicate()
-				return
-			}
-			nextIndex = r.rf.log_base_index + 1
-			r.NeedReplicate()
-		} else if nextIndexLocal < nextIndex {
-			nextIndex = nextIndexLocal
-			DPrintf("Replicator %d of %d: Log inconsistency, decrease nextIndex to %d and retry\n", r.to, r.me, nextIndexLocal)
-			r.NeedReplicate()
-		}
+		mu.Lock()
+		nextIndex = nextIndexLocal
 		mu.Unlock()
+		DPrintf("Replicator %d of %d: Log inconsistency, decrease nextIndex to %d and retry\n", r.to, r.me, nextIndexLocal)
+		r.NeedReplicate()
 	}
 
 	sent := false
