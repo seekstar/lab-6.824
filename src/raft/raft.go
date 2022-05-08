@@ -592,7 +592,7 @@ func (rf *Raft) Applier(applyCh chan ApplyMsg) {
 func (rf *Raft) ApplyCmds() {
 	for rf.lastApplied < rf.commitIndex {
 		rf.lastApplied++
-		fmt.Printf("%d: ApplyCmds: log = %v, rf.lastApplied = %d, rf.log_base_index = %d\n", rf.me, rf.log, rf.lastApplied, rf.log_base_index)
+		// fmt.Printf("%d: ApplyCmds: log = %v, rf.lastApplied = %d, rf.log_base_index = %d\n", rf.me, rf.log, rf.lastApplied, rf.log_base_index)
 		cmd := rf.log[rf.lastApplied-rf.log_base_index].Command
 		rf.applyEntryCh <- &ApplyMsg{true, cmd, rf.lastApplied, false, nil, 0, 0}
 	}
@@ -791,9 +791,6 @@ func (r *Replicator) run() {
 		reply := AppendEntriesReply{}
 		ok := r.rf.peers[r.to].Call("Raft.AppendEntries", args, &reply)
 		if !ok {
-			if len(args.Entries) != 0 {
-				r.NeedReplicate()
-			}
 			return
 		}
 		if reply.Success {
