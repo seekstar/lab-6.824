@@ -437,9 +437,6 @@ func (rf *Raft) LastLogIndex() int {
 	return rf.log_base_index + len(rf.log) - 1
 }
 func (rf *Raft) LastLogTerm() int {
-	if len(rf.log) == 0 {
-		return 0
-	}
 	return rf.log[len(rf.log)-1].Term
 }
 func (rf *Raft) LogUpToDate(args *RequestVoteArgs) bool {
