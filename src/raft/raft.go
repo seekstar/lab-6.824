@@ -244,7 +244,7 @@ func (rf *Raft) InstallSnapshotRaw(args *InstallSnapshotChItem) {
 		return
 	}
 	rf.snapshot = snapshot.Snapshot
-	if snapshot.Index-rf.log_base_index < len(rf.log) {
+	if snapshot.Index-rf.log_base_index < len(rf.log) && (snapshot.Term == 0 || rf.log[snapshot.Index-rf.log_base_index].Term == snapshot.Term) {
 		rf.log = rf.log[snapshot.Index-rf.log_base_index:]
 	} else {
 		rf.log = []LogEntry{{Term: snapshot.Term}}
@@ -915,6 +915,7 @@ func (rf *Raft) doFollower() int {
 	quit := make(chan struct{})
 	go rf.electionTrigger(electionFire, refreshCh, quit)
 	refresh := func() {
+		DPrintf("%d: Refresh election timer\n", rf.me)
 		select {
 		case refreshCh <- struct{}{}:
 		default:
@@ -959,7 +960,6 @@ func (rf *Raft) doFollower() int {
 				reply.Term = rf.currentTerm
 				reply.Success = false
 			} else {
-				DPrintf("%d: Refresh election timer\n", rf.me)
 				refresh()
 				if rf.currentTerm < args.Term {
 					rf.updateTerm(args.Term)
