@@ -136,8 +136,8 @@ type Raft struct {
 	putCmdCh          chan PutCmdReq
 	appendEntriesChan chan AppendEntriesArgsReply
 	installSnapshotCh chan *InstallSnapshotChItem
-	applyEntryCh      chan *ApplyMsg // non-block
-	applySnapshotCh   chan *ApplyMsg // non-block
+	applyEntryCh      chan *ApplyMsg // non-block if not quit
+	applySnapshotCh   chan *ApplyMsg // non-block if not quit
 	quit              chan struct{}
 	quit_done         chan struct{}
 }
@@ -146,9 +146,17 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	replyCh := make(chan ServerState)
-	rf.getStateCh <- replyCh
-	reply := <-replyCh
-	return reply.term, reply.isLeader
+	select {
+	case <-rf.quit:
+		return 0, false
+	case rf.getStateCh <- replyCh:
+	}
+	select {
+	case <-rf.quit:
+		return 0, false
+	case reply := <-replyCh:
+		return reply.term, reply.isLeader
+	}
 }
 
 //
@@ -229,7 +237,10 @@ func (rf *Raft) InstallSnapshotRaw(args *InstallSnapshotChItem) {
 	DPrintf("%d: InstallSnapshotRaw, index = %d\n", rf.me, snapshot.Index)
 	if args.snapshot.Index <= rf.log_base_index {
 		DPrintf("%d: An old snapshot\n", rf.me)
-		args.reply <- struct{}{}
+		select {
+		case <-rf.quit:
+		case args.reply <- struct{}{}:
+		}
 		return
 	}
 	rf.snapshot = snapshot.Snapshot
@@ -243,9 +254,16 @@ func (rf *Raft) InstallSnapshotRaw(args *InstallSnapshotChItem) {
 	rf.lastApplied = MaxInt(rf.lastApplied, snapshot.Index)
 	rf.persist()
 	if args.apply {
-		rf.applySnapshotCh <- &ApplyMsg{false, nil, 0, true, rf.snapshot, rf.log[0].Term, rf.log_base_index}
+		select {
+		case <-rf.quit:
+			return
+		case rf.applySnapshotCh <- &ApplyMsg{false, nil, 0, true, rf.snapshot, rf.log[0].Term, rf.log_base_index}:
+		}
 	}
-	args.reply <- struct{}{}
+	select {
+	case <-rf.quit:
+	case args.reply <- struct{}{}:
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -256,7 +274,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	DPrintf("%d: Snapshot, index = %d\n", rf.me, index)
 	reply := make(chan struct{})
-	rf.installSnapshotCh <- &InstallSnapshotChItem{
+	select {
+	case <-rf.quit:
+		fmt.Printf("%d: Snapshot called while being killed! How to handle this?\n", rf.me)
+		return
+	case rf.installSnapshotCh <- &InstallSnapshotChItem{
 		&SnapshotArgs{
 			0, // Won't be required
 			index,
@@ -264,9 +286,15 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		},
 		false,
 		reply,
+	}:
 	}
 	DPrintf("%d: Snapshot function waiting for reply of %d\n", rf.me, index)
-	<-reply
+	select {
+	case <-rf.quit:
+		fmt.Printf("%d: Snapshot called while being killed! How to handle this?\n", rf.me)
+		return
+	case <-reply:
+	}
 	DPrintf("%d: Snapshot function for %d returns\n", rf.me, index)
 }
 
@@ -360,10 +388,23 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
+	DPrintf("%d: Start(%v)\n", rf.me, command)
 	replyCh := make(chan PutCmdReply)
-	rf.putCmdCh <- PutCmdReq{command, replyCh}
-	reply := <-replyCh
-	return reply.index, reply.term, reply.isLeader
+	select {
+	case <-rf.quit:
+		DPrintf("%d: Start aborted\n", rf.me)
+		return -1, -1, false
+	case rf.putCmdCh <- PutCmdReq{command, replyCh}:
+	}
+	DPrintf("%d: Start(%v) waiting for reply\n", rf.me, command)
+	select {
+	case <-rf.quit:
+		DPrintf("%d: Start aborted\n", rf.me)
+		return -1, -1, false
+	case reply := <-replyCh:
+		DPrintf("%d: Start(%v) index = %d, term = %d, isLeader = %v\n", rf.me, command, reply.index, reply.term, reply.isLeader)
+		return reply.index, reply.term, reply.isLeader
+	}
 }
 
 //
@@ -382,6 +423,7 @@ func (rf *Raft) Kill() {
 	DPrintf("Killing %d\n", rf.me)
 	close(rf.quit)
 	<-rf.quit_done
+	DPrintf("%d: Killed\n", rf.me)
 }
 
 //
@@ -591,7 +633,14 @@ func (rf *Raft) ApplyCmds() {
 		rf.lastApplied++
 		// fmt.Printf("%d: ApplyCmds: log = %v, rf.lastApplied = %d, rf.log_base_index = %d\n", rf.me, rf.log, rf.lastApplied, rf.log_base_index)
 		cmd := rf.log[rf.lastApplied-rf.log_base_index].Command
-		rf.applyEntryCh <- &ApplyMsg{true, cmd, rf.lastApplied, false, nil, 0, 0}
+		DPrintf("%d: ApplyCmds: Sending %d %v to applier\n", rf.me, rf.lastApplied, cmd)
+		select {
+		case <-rf.quit:
+			DPrintf("%d: ApplyCmds: Quit\n", rf.me)
+			return
+		case rf.applyEntryCh <- &ApplyMsg{true, cmd, rf.lastApplied, false, nil, 0, 0}:
+			DPrintf("%d: ApplyCmds: Sent %d %v to applier\n", rf.me, rf.lastApplied, cmd)
+		}
 	}
 }
 
@@ -649,7 +698,7 @@ func (rf *Raft) appendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// fmt.Printf("%d: AppendEntries from %d request received\n", rf.me, args.LeaderId)
+	// fmt.Printf("%d: AppendEntries RPC from %d\n", rf.me, args.LeaderId)
 	replyChan := make(chan AppendEntriesReply)
 	rf.appendEntriesChan <- AppendEntriesArgsReply{args, replyChan}
 	// fmt.Printf("%d: RPC AppendEntries: sent to raft server\n", rf.me)
@@ -859,7 +908,7 @@ const (
 	StateQuit
 )
 
-func (rf *Raft) doFollower() (next int) {
+func (rf *Raft) doFollower() int {
 	DPrintf("%d: doFollower, currentTerm = %d\n", rf.me, rf.currentTerm)
 	electionFire := make(chan struct{})
 	refreshCh := make(chan struct{}, 1)
@@ -876,16 +925,19 @@ func (rf *Raft) doFollower() (next int) {
 		select {
 		case <-rf.quit:
 			close(quit)
-			next = StateQuit
-			return
+			return StateQuit
 		case <-electionFire:
 			// Time out, starts election
 			close(quit)
-			next = StateCandidate
-			return
+			return StateCandidate
 		case req := <-rf.getStateCh:
 			DPrintf("%d: I am a follower, currentTerm = %d\n", rf.me, rf.currentTerm)
-			req <- ServerState{rf.me, rf.currentTerm, false}
+			select {
+			case <-rf.quit:
+				close(quit)
+				return StateQuit
+			case req <- ServerState{rf.me, rf.currentTerm, false}:
+			}
 		case req := <-rf.requestVoteCh:
 			reply := rf.handleVoteRequest(req.args)
 			if reply.VoteGranted {
@@ -893,7 +945,12 @@ func (rf *Raft) doFollower() (next int) {
 			}
 			req.reply <- reply
 		case req := <-rf.putCmdCh:
-			req.reply <- PutCmdReply{-1, -1, false}
+			select {
+			case <-rf.quit:
+				close(quit)
+				return StateQuit
+			case req.reply <- PutCmdReply{-1, -1, false}:
+			}
 		case req := <-rf.appendEntriesChan:
 			args := req.args
 			DPrintf("%d: Message received from Leader %d\n", rf.me, args.LeaderId)
@@ -916,7 +973,7 @@ func (rf *Raft) doFollower() (next int) {
 		}
 	}
 }
-func (rf *Raft) doCandidate() (next int) {
+func (rf *Raft) doCandidate() int {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.persist()
@@ -945,25 +1002,32 @@ func (rf *Raft) doCandidate() (next int) {
 		select {
 		case <-rf.quit:
 			close(abort)
-			next = StateQuit
-			return
+			return StateQuit
 		case <-electionFire:
 			close(abort)
-			next = StateCandidate
-			return
+			return StateCandidate
 		case req := <-rf.getStateCh:
 			DPrintf("%d: I am a candidate, currentTerm = %d\n", rf.me, rf.currentTerm)
-			req <- ServerState{rf.me, rf.currentTerm, false}
+			select {
+			case <-rf.quit:
+				close(abort)
+				return StateQuit
+			case req <- ServerState{rf.me, rf.currentTerm, false}:
+			}
 		case req := <-rf.requestVoteCh:
 			req.reply <- rf.handleVoteRequest(req.args)
 			if rf.votedFor != rf.me {
 				// A newer term, convert to follower
 				close(abort)
-				next = StateFollower
-				return
+				return StateFollower
 			}
 		case req := <-rf.putCmdCh:
-			req.reply <- PutCmdReply{-1, -1, false}
+			select {
+			case <-rf.quit:
+				close(abort)
+				return StateQuit
+			case req.reply <- PutCmdReply{-1, -1, false}:
+			}
 		case req := <-rf.appendEntriesChan:
 			if rf.currentTerm > req.args.Term {
 				// Reject
@@ -976,8 +1040,7 @@ func (rf *Raft) doCandidate() (next int) {
 			var reply AppendEntriesReply
 			rf.appendEntries(req.args, &reply)
 			req.reply <- reply
-			next = StateFollower
-			return
+			return StateFollower
 		case args := <-rf.installSnapshotCh:
 			rf.InstallSnapshotRaw(args)
 		case term := <-refused:
@@ -985,21 +1048,19 @@ func (rf *Raft) doCandidate() (next int) {
 				// New term, convert to follower.
 				close(abort)
 				rf.updateTerm(term)
-				next = StateFollower
-				return
+				return StateFollower
 			}
 		case <-granted:
 			grantedCnt++
 			if grantedCnt > len(rf.peers)/2 {
 				// Received votes from majority of servers
 				close(abort)
-				next = StateLeader
-				return
+				return StateLeader
 			}
 		}
 	}
 }
-func (rf *Raft) doLeader() (next int) {
+func (rf *Raft) doLeader() int {
 	DPrintf("%d: doLeader, currentTerm = %d\n", rf.me, rf.currentTerm)
 	matchIndexes := make([]int, len(rf.peers))
 	matchIndexes[rf.me] = rf.LastLogIndex()
@@ -1034,15 +1095,13 @@ func (rf *Raft) doLeader() (next int) {
 		select {
 		case <-rf.quit:
 			abort()
-			next = StateQuit
-			return
+			return StateQuit
 		case term := <-higherTerm:
 			if term > rf.currentTerm {
 				rf.updateTerm(term)
 			}
 			abort()
-			next = StateFollower
-			return
+			return StateFollower
 		case req := <-rf.getStateCh:
 			DPrintf("%d: I am the leader, currentTerm = %d\n", rf.me, rf.currentTerm)
 			req <- ServerState{rf.me, rf.currentTerm, true}
@@ -1051,8 +1110,7 @@ func (rf *Raft) doLeader() (next int) {
 			if rf.votedFor != rf.me {
 				// A newer term. Convert to follower
 				abort()
-				next = StateFollower
-				return
+				return StateFollower
 			}
 		case req := <-rf.putCmdCh:
 			DPrintf("%d: Putting command %d\n", rf.me, req.cmd)
@@ -1062,7 +1120,12 @@ func (rf *Raft) doLeader() (next int) {
 			rf.log = append(rf.log, LogEntry{rf.currentTerm, req.cmd})
 			rf.persist()
 			rf.mu.Unlock()
-			req.reply <- reply
+			select {
+			case <-rf.quit:
+				abort()
+				return StateQuit
+			case req.reply <- reply:
+			}
 			matchIndexes[rf.me] = i
 			for _, r := range replicators {
 				r.NeedReplicate()
@@ -1079,8 +1142,7 @@ func (rf *Raft) doLeader() (next int) {
 			var reply AppendEntriesReply
 			rf.appendEntries(req.args, &reply)
 			req.reply <- reply
-			next = StateFollower
-			return
+			return StateFollower
 		case matchIndex := <-matchIndexCh:
 			if matchIndexes[matchIndex.first] >= matchIndex.second {
 				break
@@ -1092,10 +1154,13 @@ func (rf *Raft) doLeader() (next int) {
 			sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 			majorityIndex := sorted[len(rf.peers)/2]
 			if majorityIndex > rf.commitIndex && (rf.log[majorityIndex-rf.log_base_index].Term == rf.currentTerm || majorityIndex == sorted[0]) {
+				// fmt.Printf("%d: rf.mu.Lock\n", rf.me)
 				rf.mu.Lock()
+				// fmt.Printf("%d: rf.mu.Locked\n", rf.me)
 				rf.commitIndex = majorityIndex
 				rf.ApplyCmds()
 				rf.mu.Unlock()
+				// fmt.Printf("%d: rf.mu.Unlocked\n", rf.me)
 			}
 		case args := <-rf.installSnapshotCh:
 			DPrintf("%d: InstallSnapshotArgs received\n", rf.me)
@@ -1119,5 +1184,5 @@ func (rf *Raft) do(state int) {
 			break
 		}
 	}
-	rf.quit_done <- struct{}{}
+	close(rf.quit_done)
 }
