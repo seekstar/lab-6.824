@@ -274,16 +274,17 @@ func (kv *KVServer) handleAppliedCommand(msg *raft.ApplyMsg) {
 }
 
 func (kv *KVServer) installSnapshot(index int, snapshot []byte) {
+	if kv.lastApplied >= index {
+		// The snapshot is not newer. Just ignore it.
+		return
+	}
+	kv.lastApplied = index
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 	err := d.Decode(&kv.kv)
 	if err != nil {
 		log.Fatalln(err.Error())
 	}
-	if kv.lastApplied > index {
-		log.Fatalf("Snapshot index (%d) < last applied index (%d)\n", index, kv.lastApplied)
-	}
-	kv.lastApplied = index
 }
 
 func (kv *KVServer) Run() {
