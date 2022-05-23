@@ -231,28 +231,30 @@ func (kv *KVServer) Run() {
 				kv.mu.Unlock()
 			} else if t == reflect.TypeOf(PutAppendArgs{}) {
 				args := msg.Command.(PutAppendArgs)
-				if args.Op == "Append" {
-					if v, ok := kv.kv[args.Key]; ok {
-						v += args.Value
-						kv.kv[args.Key] = v
-					} else {
-						kv.kv[args.Key] = args.Value
-					}
-				} else if args.Op == "Put" {
-					kv.kv[args.Key] = args.Value
-				} else {
-					log.Fatalf("Unknown operator: %s\n", args.Op)
-				}
-				reply := PutAppendReply{
-					Err: OK,
-				}
-
-				sessionReply := SessionReply{
-					seq:   args.Seq,
-					reply: reply,
-				}
 				kv.mu.Lock()
-				kv.replyBuf[args.SessionID] = sessionReply
+				sessionReply, ok := kv.replyBuf[args.SessionID]
+				if !ok || sessionReply.seq != args.Seq {
+					if args.Op == "Append" {
+						if v, ok := kv.kv[args.Key]; ok {
+							v += args.Value
+							kv.kv[args.Key] = v
+						} else {
+							kv.kv[args.Key] = args.Value
+						}
+					} else if args.Op == "Put" {
+						kv.kv[args.Key] = args.Value
+					} else {
+						log.Fatalf("Unknown operator: %s\n", args.Op)
+					}
+					reply := PutAppendReply{
+						Err: OK,
+					}
+					sessionReply := SessionReply{
+						seq:   args.Seq,
+						reply: reply,
+					}
+					kv.replyBuf[args.SessionID] = sessionReply
+				}
 				replyChan, ok := kv.replyChans[args.SessionID]
 				if ok {
 					delete(kv.replyChans, args.SessionID)
