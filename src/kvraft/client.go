@@ -60,21 +60,9 @@ func (ck *Clerk) Get(key string) string {
 		SessionID: ck.sessionID,
 		Seq:       seq,
 	}
-	i := ck.knownLeader
-	for {
-		var reply GetReply
-		DPrintf("%d: Calling %d KVServer.Get\n", ck.sessionID, i)
-		ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
-		if ok && reply.Err != "ErrWrongLeader" {
-			if reply.Err != OK {
-				log.Fatalf("%d: Unexpected error in reply: %s\n", ck.sessionID, reply.Err)
-			}
-			ck.knownLeader = i
-			DPrintf("%d: Get (%s) returns (%s)\n", ck.sessionID, key, reply.Value)
-			return reply.Value
-		}
-		i = (i + 1) % int64(len(ck.servers))
-	}
+	reply := ck.PutCommand(GetRPC, &args).(GetReply)
+	DPrintf("%d: Get (%s) returns (%s)\n", ck.sessionID, key, reply.Value)
+	return reply.Value
 }
 
 //
@@ -97,21 +85,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		SessionID: ck.sessionID,
 		Seq:       seq,
 	}
-	i := ck.knownLeader
-	for {
-		var reply PutAppendReply
-		DPrintf("%d: Calling %d KVServer.PutAppend\n", ck.sessionID, i)
-		ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
-		if ok && reply.Err != "ErrWrongLeader" {
-			if reply.Err != OK {
-				log.Fatalf("%d: Unexpected error in reply: %s\n", ck.sessionID, reply.Err)
-			}
-			ck.knownLeader = i
-			DPrintf("%d: %s (%s) (%s) done\n", ck.sessionID, op, key, value)
-			return
-		}
-		i = (i + 1) % int64(len(ck.servers))
-	}
+	ck.PutCommand(PutAppendRPC, &args)
+	DPrintf("%d: %s (%s) (%s) done\n", ck.sessionID, op, key, value)
 }
 
 func (ck *Clerk) Put(key string, value string) {
@@ -121,4 +96,51 @@ func (ck *Clerk) Put(key string, value string) {
 func (ck *Clerk) Append(key string, value string) {
 	DPrintf("%d: Append (%s) (%s)\n", ck.sessionID, key, value)
 	ck.PutAppend(key, value, "Append")
+}
+
+type PutCommandRes struct {
+	from  int
+	reply Reply
+}
+
+type RPCReply struct {
+	ok    bool
+	reply Reply
+}
+
+func GetRPC(ck *Clerk, i int64, args interface{}) RPCReply {
+	var reply GetReply
+	DPrintf("%d: Calling %d KVServer.Get\n", ck.sessionID, i)
+	ok := ck.servers[i].Call("KVServer.Get", args, &reply)
+	return RPCReply{
+		ok,
+		reply,
+	}
+}
+
+func PutAppendRPC(ck *Clerk, i int64, args interface{}) RPCReply {
+	var reply PutAppendReply
+	DPrintf("%d: Calling %d KVServer.PutAppend\n", ck.sessionID, i)
+	ok := ck.servers[i].Call("KVServer.PutAppend", args, &reply)
+	return RPCReply{
+		ok,
+		reply,
+	}
+}
+
+func (ck *Clerk) PutCommand(rpc func(*Clerk, int64, interface{}) RPCReply, args interface{}) Reply {
+	i := ck.knownLeader
+	for {
+		rpcreply := rpc(ck, i, args)
+		ok := rpcreply.ok
+		reply := rpcreply.reply
+		if ok && reply.err() != "ErrWrongLeader" {
+			if reply.err() != OK {
+				log.Fatalf("%d: Unexpected error in reply: %s\n", ck.sessionID, reply.err())
+			}
+			ck.knownLeader = i
+			return reply
+		}
+		i = (i + 1) % int64(len(ck.servers))
+	}
 }

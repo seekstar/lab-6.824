@@ -39,3 +39,15 @@ type GetReply struct {
 	Err   Err
 	Value string
 }
+
+type Reply interface {
+	err() Err
+}
+
+func (r GetReply) err() Err {
+	return r.Err
+}
+
+func (r PutAppendReply) err() Err {
+	return r.Err
+}
