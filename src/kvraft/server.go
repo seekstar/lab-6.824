@@ -1,15 +1,16 @@
 package kvraft
 
 import (
+	"log"
+	"reflect"
+	"sync"
+
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
-	"log"
-	"sync"
-	"sync/atomic"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -18,32 +19,117 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-}
-
 type KVServer struct {
-	mu      sync.Mutex
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-}
+	mu         sync.Mutex
+	replyChans map[int64]chan interface{}
+	replyBuf   map[int64]SessionReplyBuf
 
+	kv map[string]string
+
+	quit chan struct{}
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	DPrintf("%d: RPC Get, %d %d, %s\n", kv.me, args.SessionID, args.Seq, args.Key)
+	kv.mu.Lock()
+	if buf, ok := kv.replyBuf[args.SessionID]; ok {
+		if buf.seq == args.Seq {
+			*reply = buf.reply.(GetReply)
+			kv.mu.Unlock()
+			return
+		} else if buf.seq > args.Seq {
+			kv.mu.Unlock()
+			*reply = GetReply{
+				Err: ErrObsoleteRequest,
+			}
+			return
+		}
+	}
+	replyChan := make(chan interface{}, 1)
+	if c, ok := kv.replyChans[args.SessionID]; ok {
+		close(c)
+	}
+	kv.replyChans[args.SessionID] = replyChan
+	kv.mu.Unlock()
+	_, _, isLeader := kv.rf.Start(*args)
+	if !isLeader {
+		kv.mu.Lock()
+		if r, ok := kv.replyChans[args.SessionID]; ok && r == replyChan {
+			delete(kv.replyChans, args.SessionID)
+		} else {
+			// It has already been taken out.
+			// It's okay to not listen to it. It's non-blocking anyway.
+		}
+		kv.mu.Unlock()
+		reply.Err = ErrWrongLeader
+		return
+	}
+	select {
+	case <-kv.quit:
+		reply.Err = ErrWrongLeader
+	case r, ok := <-replyChan:
+		if !ok {
+			reply.Err = ErrReplacedRequest
+		} else {
+			*reply = r.(GetReply)
+		}
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	DPrintf("%d: RPC PutAppend, %d %d, %s (%s) (%s)", kv.me, args.SessionID, args.Seq, args.Op, args.Key, args.Value)
+	kv.mu.Lock()
+	if buf, ok := kv.replyBuf[args.SessionID]; ok {
+		if buf.seq == args.Seq {
+			*reply = buf.reply.(PutAppendReply)
+			kv.mu.Unlock()
+			return
+		} else if buf.seq > args.Seq {
+			kv.mu.Unlock()
+			*reply = PutAppendReply{
+				Err: OK,
+			}
+			return
+		}
+	}
+	replyChan := make(chan interface{}, 1)
+	if c, ok := kv.replyChans[args.SessionID]; ok {
+		close(c)
+	}
+	kv.replyChans[args.SessionID] = replyChan
+	kv.mu.Unlock()
+	_, _, isLeader := kv.rf.Start(*args)
+	if !isLeader {
+		kv.mu.Lock()
+		if r, ok := kv.replyChans[args.SessionID]; ok && r == replyChan {
+			delete(kv.replyChans, args.SessionID)
+		} else {
+			// It has already been taken out.
+			// It's okay to not listen to it. It's non-blocking anyway.
+		}
+		kv.mu.Unlock()
+		reply.Err = ErrWrongLeader
+		return
+	}
+	select {
+	case <-kv.quit:
+		reply.Err = ErrWrongLeader
+	case r, ok := <-replyChan:
+		if !ok {
+			reply.Err = ErrReplacedRequest
+		} else {
+			*reply = r.(PutAppendReply)
+		}
+	}
 }
 
 //
@@ -57,14 +143,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // to suppress debug output from a Kill()ed instance.
 //
 func (kv *KVServer) Kill() {
-	atomic.StoreInt32(&kv.dead, 1)
+	DPrintf("Killing %d\n", kv.me)
+	close(kv.quit)
 	kv.rf.Kill()
-	// Your code here, if desired.
-}
-
-func (kv *KVServer) killed() bool {
-	z := atomic.LoadInt32(&kv.dead)
-	return z == 1
+	DPrintf("%d: Killed\n", kv.me)
 }
 
 //
@@ -84,7 +166,8 @@ func (kv *KVServer) killed() bool {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
+	labgob.Register(PutAppendArgs{})
+	labgob.Register(GetArgs{})
 
 	kv := new(KVServer)
 	kv.me = me
@@ -97,5 +180,84 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
+	kv.replyChans = make(map[int64]chan interface{})
+	kv.replyBuf = make(map[int64]SessionReplyBuf)
+	kv.kv = make(map[string]string)
+	kv.quit = make(chan struct{})
+
+	go kv.Run()
+
 	return kv
+}
+
+type SessionReplyBuf struct {
+	seq   int64
+	reply interface{}
+}
+
+func (kv *KVServer) Run() {
+	for {
+		select {
+		case <-kv.quit:
+			return
+		case msg := <-kv.applyCh:
+			DPrintf("%d: %v applied\n", kv.me, msg.Command)
+			t := reflect.TypeOf(msg.Command)
+			if t == reflect.TypeOf(GetArgs{}) {
+				args := msg.Command.(GetArgs)
+				var reply GetReply
+				if v, ok := kv.kv[args.Key]; ok {
+					reply = GetReply{
+						Err:   OK,
+						Value: v,
+					}
+				} else {
+					reply = GetReply{
+						Err: ErrNoKey,
+					}
+				}
+				kv.mu.Lock()
+				kv.replyBuf[args.SessionID] = SessionReplyBuf{
+					seq:   args.Seq,
+					reply: reply,
+				}
+				replyChan, ok := kv.replyChans[args.SessionID]
+				kv.mu.Unlock()
+				if ok {
+					delete(kv.replyChans, args.SessionID)
+					replyChan <- reply // non-blocking
+				}
+			} else if t == reflect.TypeOf(PutAppendArgs{}) {
+				args := msg.Command.(PutAppendArgs)
+				if args.Op == "Append" {
+					if v, ok := kv.kv[args.Key]; ok {
+						v += args.Value
+						kv.kv[args.Key] = v
+					} else {
+						kv.kv[args.Key] = args.Value
+					}
+				} else if args.Op == "Put" {
+					kv.kv[args.Key] = args.Value
+				} else {
+					log.Fatalf("Unknown operator: %s\n", args.Op)
+				}
+				reply := PutAppendReply{
+					Err: OK,
+				}
+				kv.mu.Lock()
+				kv.replyBuf[args.SessionID] = SessionReplyBuf{
+					seq:   args.Seq,
+					reply: reply,
+				}
+				replyChan, ok := kv.replyChans[args.SessionID]
+				kv.mu.Unlock()
+				if ok {
+					delete(kv.replyChans, args.SessionID)
+					replyChan <- reply // non-blocking
+				}
+			} else {
+				log.Fatalf("Unknown type of command: %s\n", t.Name())
+			}
+		}
+	}
 }
