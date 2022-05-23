@@ -219,7 +219,7 @@ func (kv *KVServer) Run() {
 							Err: ErrNoKey,
 						}
 					}
-					sessionReply := SessionReply{
+					sessionReply = SessionReply{
 						seq:   args.Seq,
 						reply: reply,
 					}
@@ -251,7 +251,7 @@ func (kv *KVServer) Run() {
 					reply := PutAppendReply{
 						Err: OK,
 					}
-					sessionReply := SessionReply{
+					sessionReply = SessionReply{
 						seq:   args.Seq,
 						reply: reply,
 					}
