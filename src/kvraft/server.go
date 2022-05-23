@@ -19,6 +19,11 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type SessionReply struct {
+	seq   int64
+	reply interface{}
+}
+
 type KVServer struct {
 	me      int
 	rf      *raft.Raft
@@ -28,8 +33,8 @@ type KVServer struct {
 
 	// Your definitions here.
 	mu         sync.Mutex
-	replyChans map[int64]chan interface{}
-	replyBuf   map[int64]SessionReplyBuf
+	replyChans map[int64]chan SessionReply
+	replyBuf   map[int64]SessionReply
 
 	kv map[string]string
 
@@ -53,7 +58,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			return
 		}
 	}
-	replyChan := make(chan interface{}, 1)
+	replyChan := make(chan SessionReply, 1)
 	if c, ok := kv.replyChans[args.SessionID]; ok {
 		close(c)
 	}
@@ -76,10 +81,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	case <-kv.quit:
 		reply.Err = ErrWrongLeader
 	case r, ok := <-replyChan:
-		if !ok {
+		if !ok || r.seq != args.Seq {
 			reply.Err = ErrReplacedRequest
 		} else {
-			*reply = r.(GetReply)
+			*reply = r.reply.(GetReply)
 		}
 	}
 }
@@ -101,7 +106,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			return
 		}
 	}
-	replyChan := make(chan interface{}, 1)
+	replyChan := make(chan SessionReply, 1)
 	if c, ok := kv.replyChans[args.SessionID]; ok {
 		close(c)
 	}
@@ -124,10 +129,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	case <-kv.quit:
 		reply.Err = ErrWrongLeader
 	case r, ok := <-replyChan:
-		if !ok {
+		if !ok || r.seq != args.Seq {
 			reply.Err = ErrReplacedRequest
 		} else {
-			*reply = r.(PutAppendReply)
+			*reply = r.reply.(PutAppendReply)
 		}
 	}
 }
@@ -180,19 +185,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
-	kv.replyChans = make(map[int64]chan interface{})
-	kv.replyBuf = make(map[int64]SessionReplyBuf)
+	kv.replyChans = make(map[int64]chan SessionReply)
+	kv.replyBuf = make(map[int64]SessionReply)
 	kv.kv = make(map[string]string)
 	kv.quit = make(chan struct{})
 
 	go kv.Run()
 
 	return kv
-}
-
-type SessionReplyBuf struct {
-	seq   int64
-	reply interface{}
 }
 
 func (kv *KVServer) Run() {
@@ -216,15 +216,17 @@ func (kv *KVServer) Run() {
 						Err: ErrNoKey,
 					}
 				}
-				kv.mu.Lock()
-				kv.replyBuf[args.SessionID] = SessionReplyBuf{
+
+				sessionReply := SessionReply{
 					seq:   args.Seq,
 					reply: reply,
 				}
+				kv.mu.Lock()
+				kv.replyBuf[args.SessionID] = sessionReply
 				replyChan, ok := kv.replyChans[args.SessionID]
 				if ok {
 					delete(kv.replyChans, args.SessionID)
-					replyChan <- reply // non-blocking
+					replyChan <- sessionReply // non-blocking
 				}
 				kv.mu.Unlock()
 			} else if t == reflect.TypeOf(PutAppendArgs{}) {
@@ -244,15 +246,17 @@ func (kv *KVServer) Run() {
 				reply := PutAppendReply{
 					Err: OK,
 				}
-				kv.mu.Lock()
-				kv.replyBuf[args.SessionID] = SessionReplyBuf{
+
+				sessionReply := SessionReply{
 					seq:   args.Seq,
 					reply: reply,
 				}
+				kv.mu.Lock()
+				kv.replyBuf[args.SessionID] = sessionReply
 				replyChan, ok := kv.replyChans[args.SessionID]
 				if ok {
 					delete(kv.replyChans, args.SessionID)
-					replyChan <- reply // non-blocking
+					replyChan <- sessionReply // non-blocking
 				}
 				kv.mu.Unlock()
 			} else {
