@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"log"
 	"math/big"
+	"time"
 
 	"6.824/labrpc"
 )
@@ -61,6 +62,13 @@ func (ck *Clerk) Get(key string) string {
 		Seq:       seq,
 	}
 	reply := ck.PutCommand(GetRPC, &args).(GetReply)
+	if reply.err() == ErrNoKey {
+		DPrintf("%d: Get (%s) returns ErrNoKey\n", ck.sessionID, key)
+		return ""
+	}
+	if reply.err() != OK {
+		log.Fatalf("%d: Unexpected error in reply: %s\n", ck.sessionID, reply.err())
+	}
 	DPrintf("%d: Get (%s) returns (%s)\n", ck.sessionID, key, reply.Value)
 	return reply.Value
 }
@@ -85,7 +93,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		SessionID: ck.sessionID,
 		Seq:       seq,
 	}
-	ck.PutCommand(PutAppendRPC, &args)
+	reply := ck.PutCommand(PutAppendRPC, &args).(PutAppendReply)
+	if reply.err() != OK {
+		log.Fatalf("%d: Unexpected error in reply: %s\n", ck.sessionID, reply.err())
+	}
 	DPrintf("%d: %s (%s) (%s) done\n", ck.sessionID, op, key, value)
 }
 
@@ -99,7 +110,7 @@ func (ck *Clerk) Append(key string, value string) {
 }
 
 type PutCommandRes struct {
-	from  int
+	from  int64
 	reply Reply
 }
 
@@ -128,18 +139,42 @@ func PutAppendRPC(ck *Clerk, i int64, args interface{}) RPCReply {
 	}
 }
 
+func (ck *Clerk) CallRPC(rpc func(*Clerk, int64, interface{}) RPCReply, i int64, args interface{}, resChan chan PutCommandRes, abort chan struct{}) {
+	rpcreply := rpc(ck, i, args)
+	if !rpcreply.ok {
+		// Assume that the outer logic has already been trying another server
+		return
+	}
+	reply := rpcreply.reply
+	if reply.err() == ErrReplacedRequest {
+		// The outer logic has already been trying another server
+		return
+	}
+	select {
+	case <-abort:
+	case resChan <- PutCommandRes{
+		from:  i,
+		reply: reply,
+	}:
+	}
+}
+
 func (ck *Clerk) PutCommand(rpc func(*Clerk, int64, interface{}) RPCReply, args interface{}) Reply {
+	resChan := make(chan PutCommandRes)
+	abort := make(chan struct{})
 	i := ck.knownLeader
 	for {
-		rpcreply := rpc(ck, i, args)
-		ok := rpcreply.ok
-		reply := rpcreply.reply
-		if ok && reply.err() != "ErrWrongLeader" {
-			if reply.err() != OK {
-				log.Fatalf("%d: Unexpected error in reply: %s\n", ck.sessionID, reply.err())
+		go ck.CallRPC(rpc, i, args, resChan, abort)
+		select {
+		case <-time.After(time.Millisecond * 500):
+			DPrintf("Timeout\n")
+		case res := <-resChan:
+			if res.reply.err() == "ErrWrongLeader" {
+				break
 			}
-			ck.knownLeader = i
-			return reply
+			close(abort)
+			ck.knownLeader = res.from
+			return res.reply
 		}
 		i = (i + 1) % int64(len(ck.servers))
 	}

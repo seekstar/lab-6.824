@@ -222,11 +222,11 @@ func (kv *KVServer) Run() {
 					reply: reply,
 				}
 				replyChan, ok := kv.replyChans[args.SessionID]
-				kv.mu.Unlock()
 				if ok {
 					delete(kv.replyChans, args.SessionID)
 					replyChan <- reply // non-blocking
 				}
+				kv.mu.Unlock()
 			} else if t == reflect.TypeOf(PutAppendArgs{}) {
 				args := msg.Command.(PutAppendArgs)
 				if args.Op == "Append" {
@@ -250,11 +250,11 @@ func (kv *KVServer) Run() {
 					reply: reply,
 				}
 				replyChan, ok := kv.replyChans[args.SessionID]
-				kv.mu.Unlock()
 				if ok {
 					delete(kv.replyChans, args.SessionID)
 					replyChan <- reply // non-blocking
 				}
+				kv.mu.Unlock()
 			} else {
 				log.Fatalf("Unknown type of command: %s\n", t.Name())
 			}
