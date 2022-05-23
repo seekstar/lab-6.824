@@ -205,24 +205,26 @@ func (kv *KVServer) Run() {
 			t := reflect.TypeOf(msg.Command)
 			if t == reflect.TypeOf(GetArgs{}) {
 				args := msg.Command.(GetArgs)
-				var reply GetReply
-				if v, ok := kv.kv[args.Key]; ok {
-					reply = GetReply{
-						Err:   OK,
-						Value: v,
-					}
-				} else {
-					reply = GetReply{
-						Err: ErrNoKey,
-					}
-				}
-
-				sessionReply := SessionReply{
-					seq:   args.Seq,
-					reply: reply,
-				}
 				kv.mu.Lock()
-				kv.replyBuf[args.SessionID] = sessionReply
+				sessionReply, ok := kv.replyBuf[args.SessionID]
+				if !ok || sessionReply.seq != args.Seq {
+					var reply GetReply
+					if v, ok := kv.kv[args.Key]; ok {
+						reply = GetReply{
+							Err:   OK,
+							Value: v,
+						}
+					} else {
+						reply = GetReply{
+							Err: ErrNoKey,
+						}
+					}
+					sessionReply := SessionReply{
+						seq:   args.Seq,
+						reply: reply,
+					}
+					kv.replyBuf[args.SessionID] = sessionReply
+				}
 				replyChan, ok := kv.replyChans[args.SessionID]
 				if ok {
 					delete(kv.replyChans, args.SessionID)
