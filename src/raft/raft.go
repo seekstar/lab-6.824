@@ -124,12 +124,14 @@ type Raft struct {
 	randGen *rand.Rand
 	log     []LogEntry // log[0].Term is the term of the last log entry in snapshot
 	// To support log compaction in the future.
-	// Log entries whose indexes are smaller than log_base_index are archived.
-	log_base_index int // Index of log[0]
-	snapshot       []byte
+	// Log entries whose indexes are smaller than LogBaseIndex are archived.
+	LogBaseIndex int // Index of log[0]
+	snapshot     []byte
 
 	commitIndex int
 	lastApplied int
+
+	PersistedSizeCh chan int
 
 	getStateCh        chan chan ServerState
 	requestVoteCh     chan VoteReq
@@ -166,15 +168,22 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	DPrintf("%d: Persisting currentTerm = %d, votedFor = %d, log_base_index = %d, log = %v\n", rf.me, rf.currentTerm, rf.votedFor, rf.log_base_index, rf.log)
+	DPrintf("%d: Persisting currentTerm = %d, votedFor = %d, log_base_index = %d, log = %v\n", rf.me, rf.currentTerm, rf.votedFor, rf.LogBaseIndex, rf.log)
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
-	e.Encode(rf.log_base_index)
+	e.Encode(rf.LogBaseIndex)
 	e.Encode(rf.log)
 	state := w.Bytes()
 	rf.persister.SaveStateAndSnapshot(state, rf.snapshot)
+	for {
+		select {
+		case <-rf.PersistedSizeCh:
+		case rf.PersistedSizeCh <- rf.persister.RaftStateSize():
+			return
+		}
+	}
 }
 
 //
@@ -200,10 +209,10 @@ func (rf *Raft) readPersist(state []byte, snapshot []byte) bool {
 	}
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
-	rf.log_base_index = log_base_index
+	rf.LogBaseIndex = log_base_index
 	rf.log = log
 	rf.snapshot = snapshot
-	DPrintf("%d: readPersist: currentTerm = %d, votedFor = %d, log_base_index = %d, log = %v\n", rf.me, rf.currentTerm, rf.votedFor, rf.log_base_index, rf.log)
+	DPrintf("%d: readPersist: currentTerm = %d, votedFor = %d, log_base_index = %d, log = %v\n", rf.me, rf.currentTerm, rf.votedFor, rf.LogBaseIndex, rf.log)
 	return false
 }
 
@@ -235,7 +244,7 @@ type InstallSnapshotChItem struct {
 func (rf *Raft) InstallSnapshotRaw(args *InstallSnapshotChItem) {
 	snapshot := args.snapshot
 	DPrintf("%d: InstallSnapshotRaw, index = %d\n", rf.me, snapshot.Index)
-	if args.snapshot.Index <= rf.log_base_index {
+	if args.snapshot.Index <= rf.LogBaseIndex {
 		DPrintf("%d: An old snapshot\n", rf.me)
 		select {
 		case <-rf.quit:
@@ -244,12 +253,12 @@ func (rf *Raft) InstallSnapshotRaw(args *InstallSnapshotChItem) {
 		return
 	}
 	rf.snapshot = snapshot.Snapshot
-	if snapshot.Index-rf.log_base_index < len(rf.log) && (snapshot.Term == 0 || rf.log[snapshot.Index-rf.log_base_index].Term == snapshot.Term) {
-		rf.log = rf.log[snapshot.Index-rf.log_base_index:]
+	if snapshot.Index-rf.LogBaseIndex < len(rf.log) && (snapshot.Term == 0 || rf.log[snapshot.Index-rf.LogBaseIndex].Term == snapshot.Term) {
+		rf.log = rf.log[snapshot.Index-rf.LogBaseIndex:]
 	} else {
 		rf.log = []LogEntry{{Term: snapshot.Term}}
 	}
-	rf.log_base_index = snapshot.Index
+	rf.LogBaseIndex = snapshot.Index
 	rf.commitIndex = MaxInt(rf.commitIndex, snapshot.Index)
 	rf.lastApplied = MaxInt(rf.lastApplied, snapshot.Index)
 	rf.persist()
@@ -257,7 +266,7 @@ func (rf *Raft) InstallSnapshotRaw(args *InstallSnapshotChItem) {
 		select {
 		case <-rf.quit:
 			return
-		case rf.applySnapshotCh <- &ApplyMsg{false, nil, 0, true, rf.snapshot, rf.log[0].Term, rf.log_base_index}:
+		case rf.applySnapshotCh <- &ApplyMsg{false, nil, 0, true, rf.snapshot, rf.log[0].Term, rf.LogBaseIndex}:
 		}
 	}
 	select {
@@ -448,8 +457,10 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.votedFor = -1
 	rf.randGen = rand.New(rand.NewSource(int64(me)))
 	rf.log = []LogEntry{{Term: 0}}
-	rf.log_base_index = 0
+	rf.LogBaseIndex = 0
 	rf.snapshot = nil
+
+	rf.PersistedSizeCh = make(chan int, 1)
 
 	rf.getStateCh = make(chan chan ServerState)
 	rf.requestVoteCh = make(chan VoteReq)
@@ -466,8 +477,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 		fmt.Printf("%d: Fail to read persistend data!\n", rf.me)
 		return nil
 	}
-	rf.lastApplied = rf.log_base_index
-	rf.commitIndex = rf.log_base_index
+	rf.lastApplied = rf.LogBaseIndex
+	rf.commitIndex = rf.LogBaseIndex
 
 	go rf.Applier(applyCh)
 	go rf.do(StateFollower)
@@ -476,7 +487,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 }
 
 func (rf *Raft) LastLogIndex() int {
-	return rf.log_base_index + len(rf.log) - 1
+	return rf.LogBaseIndex + len(rf.log) - 1
 }
 func (rf *Raft) LastLogTerm() int {
 	return rf.log[len(rf.log)-1].Term
@@ -632,7 +643,7 @@ func (rf *Raft) ApplyCmds() {
 	for rf.lastApplied < rf.commitIndex {
 		rf.lastApplied++
 		// fmt.Printf("%d: ApplyCmds: log = %v, rf.lastApplied = %d, rf.log_base_index = %d\n", rf.me, rf.log, rf.lastApplied, rf.log_base_index)
-		cmd := rf.log[rf.lastApplied-rf.log_base_index].Command
+		cmd := rf.log[rf.lastApplied-rf.LogBaseIndex].Command
 		DPrintf("%d: ApplyCmds: Sending %d %v to applier\n", rf.me, rf.lastApplied, cmd)
 		select {
 		case <-rf.quit:
@@ -647,22 +658,22 @@ func (rf *Raft) ApplyCmds() {
 func (rf *Raft) appendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// rf.logger.Printf("%d: _appendEntries\n", rf.me)
 	reply.Term = rf.currentTerm
-	if rf.log_base_index+len(rf.log) <= args.PrevLogIndex {
+	if rf.LogBaseIndex+len(rf.log) <= args.PrevLogIndex {
 		reply.Success = false
 		return
 	}
-	if args.PrevLogIndex < rf.log_base_index {
+	if args.PrevLogIndex < rf.LogBaseIndex {
 		// The content in snapshot is all committed and not overridable
-		if args.PrevLogIndex+len(args.Entries) <= rf.log_base_index {
+		if args.PrevLogIndex+len(args.Entries) <= rf.LogBaseIndex {
 			reply.Success = true
-			reply.NextIndex = rf.log_base_index + 1
+			reply.NextIndex = rf.LogBaseIndex + 1
 			return
 		}
-		args.Entries = args.Entries[(rf.log_base_index - args.PrevLogIndex):]
-		args.PrevLogIndex = rf.log_base_index
+		args.Entries = args.Entries[(rf.LogBaseIndex - args.PrevLogIndex):]
+		args.PrevLogIndex = rf.LogBaseIndex
 		args.PrevLogTerm = rf.log[0].Term
 	}
-	i := args.PrevLogIndex - rf.log_base_index
+	i := args.PrevLogIndex - rf.LogBaseIndex
 	if rf.log[i].Term != args.PrevLogTerm {
 		reply.Success = false
 		// rf.log = rf.log[:i]
@@ -688,12 +699,12 @@ func (rf *Raft) appendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// rf.logger.Printf("%d: args.LeaderCommit is %d\n", rf.me, args.LeaderCommit)
 	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = MinInt(args.LeaderCommit, rf.log_base_index+len(rf.log)-1)
+		rf.commitIndex = MinInt(args.LeaderCommit, rf.LogBaseIndex+len(rf.log)-1)
 		// rf.logger.Printf("Now commitIndex of %d is %d\n", rf.me, rf.commitIndex)
 	}
 	rf.ApplyCmds()
 	reply.Success = true
-	reply.NextIndex = rf.log_base_index + i + len(args.Entries) - j
+	reply.NextIndex = rf.LogBaseIndex + i + len(args.Entries) - j
 	return
 }
 
@@ -797,9 +808,9 @@ func (r *Replicator) run() {
 		mu.Unlock()
 
 		r.rf.mu.Lock()
-		if nextIndexLocal <= r.rf.log_base_index {
+		if nextIndexLocal <= r.rf.LogBaseIndex {
 			snapshot_last_term_local := r.rf.log[0].Term
-			log_base_index_local := r.rf.log_base_index
+			log_base_index_local := r.rf.LogBaseIndex
 			snapshot_local := r.rf.snapshot
 			r.rf.mu.Unlock()
 			ok := r.rf.peers[r.to].Call(
@@ -821,14 +832,14 @@ func (r *Replicator) run() {
 			return
 		}
 		args.PrevLogIndex = nextIndexLocal - 1
-		args.PrevLogTerm = r.rf.log[args.PrevLogIndex-r.rf.log_base_index].Term
+		args.PrevLogTerm = r.rf.log[args.PrevLogIndex-r.rf.LogBaseIndex].Term
 
 		args.LeaderCommit = r.rf.commitIndex
 		// It does not affect correctness if we only take reference here.
 		// But it might lead to race condition if it becomes a follower and
 		// the log is modified by the new leader while sending the RPC.
-		args.Entries = make([]LogEntry, len(r.rf.log)-(nextIndexLocal-r.rf.log_base_index))
-		copy(args.Entries, r.rf.log[nextIndexLocal-r.rf.log_base_index:])
+		args.Entries = make([]LogEntry, len(r.rf.log)-(nextIndexLocal-r.rf.LogBaseIndex))
+		copy(args.Entries, r.rf.log[nextIndexLocal-r.rf.LogBaseIndex:])
 		r.rf.mu.Unlock()
 
 		DPrintf("%d: Replicating to %d, Term = %d, LeaderCommit = %d, PrevLogIndex = %d, PrevLogTerm = %d, Entries = %v\n", r.me, r.to, args.Term, args.LeaderCommit, args.PrevLogIndex, args.PrevLogTerm, args.Entries)
@@ -1115,7 +1126,7 @@ func (rf *Raft) doLeader() int {
 		case req := <-rf.putCmdCh:
 			DPrintf("%d: Putting command %d\n", rf.me, req.cmd)
 			rf.mu.Lock()
-			i := rf.log_base_index + len(rf.log)
+			i := rf.LogBaseIndex + len(rf.log)
 			reply := PutCmdReply{i, rf.currentTerm, true}
 			rf.log = append(rf.log, LogEntry{rf.currentTerm, req.cmd})
 			rf.persist()
@@ -1153,7 +1164,7 @@ func (rf *Raft) doLeader() int {
 			sorted := append(make([]int, 0, len(matchIndexes)), matchIndexes...)
 			sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 			majorityIndex := sorted[len(rf.peers)/2]
-			if majorityIndex > rf.commitIndex && (rf.log[majorityIndex-rf.log_base_index].Term == rf.currentTerm || majorityIndex == sorted[0]) {
+			if majorityIndex > rf.commitIndex && (rf.log[majorityIndex-rf.LogBaseIndex].Term == rf.currentTerm || majorityIndex == sorted[0]) {
 				// fmt.Printf("%d: rf.mu.Lock\n", rf.me)
 				rf.mu.Lock()
 				// fmt.Printf("%d: rf.mu.Locked\n", rf.me)

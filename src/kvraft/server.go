@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"reflect"
 	"sync"
@@ -36,7 +37,8 @@ type KVServer struct {
 	replyChans map[int64]chan SessionReply
 	replyBuf   map[int64]SessionReply
 
-	kv map[string]string
+	kv          map[string]string
+	lastApplied int
 
 	quit chan struct{}
 }
@@ -173,6 +175,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(PutAppendArgs{})
 	labgob.Register(GetArgs{})
+	labgob.Register(map[string]string{})
 
 	kv := new(KVServer)
 	kv.me = me
@@ -187,12 +190,100 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.replyChans = make(map[int64]chan SessionReply)
 	kv.replyBuf = make(map[int64]SessionReply)
-	kv.kv = make(map[string]string)
+
+	snapshot := persister.ReadSnapshot()
+	if snapshot == nil || len(snapshot) == 0 {
+		kv.kv = make(map[string]string)
+		kv.lastApplied = kv.rf.LogBaseIndex
+	} else {
+		kv.installSnapshot(kv.rf.LogBaseIndex, snapshot)
+	}
+
 	kv.quit = make(chan struct{})
 
 	go kv.Run()
 
 	return kv
+}
+
+func (kv *KVServer) handleAppliedCommand(msg *raft.ApplyMsg) {
+	t := reflect.TypeOf(msg.Command)
+	if t == reflect.TypeOf(GetArgs{}) {
+		args := msg.Command.(GetArgs)
+		kv.mu.Lock()
+		sessionReply, ok := kv.replyBuf[args.SessionID]
+		if !ok || sessionReply.seq != args.Seq {
+			var reply GetReply
+			if v, ok := kv.kv[args.Key]; ok {
+				reply = GetReply{
+					Err:   OK,
+					Value: v,
+				}
+			} else {
+				reply = GetReply{
+					Err: ErrNoKey,
+				}
+			}
+			sessionReply = SessionReply{
+				seq:   args.Seq,
+				reply: reply,
+			}
+			kv.replyBuf[args.SessionID] = sessionReply
+		}
+		replyChan, ok := kv.replyChans[args.SessionID]
+		if ok {
+			delete(kv.replyChans, args.SessionID)
+			replyChan <- sessionReply // non-blocking
+		}
+		kv.mu.Unlock()
+	} else if t == reflect.TypeOf(PutAppendArgs{}) {
+		args := msg.Command.(PutAppendArgs)
+		kv.mu.Lock()
+		sessionReply, ok := kv.replyBuf[args.SessionID]
+		if !ok || sessionReply.seq != args.Seq {
+			if args.Op == "Append" {
+				if v, ok := kv.kv[args.Key]; ok {
+					v += args.Value
+					kv.kv[args.Key] = v
+				} else {
+					kv.kv[args.Key] = args.Value
+				}
+			} else if args.Op == "Put" {
+				kv.kv[args.Key] = args.Value
+			} else {
+				log.Fatalf("Unknown operator: %s\n", args.Op)
+			}
+			reply := PutAppendReply{
+				Err: OK,
+			}
+			sessionReply = SessionReply{
+				seq:   args.Seq,
+				reply: reply,
+			}
+			kv.replyBuf[args.SessionID] = sessionReply
+		}
+		replyChan, ok := kv.replyChans[args.SessionID]
+		if ok {
+			delete(kv.replyChans, args.SessionID)
+			replyChan <- sessionReply // non-blocking
+		}
+		kv.mu.Unlock()
+	} else {
+		log.Fatalf("Unknown type of command: %s\n", t.Name())
+	}
+}
+
+func (kv *KVServer) installSnapshot(index int, snapshot []byte) {
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	err := d.Decode(&kv.kv)
+	if err != nil {
+		log.Fatalln(err.Error())
+	}
+	if kv.lastApplied > index {
+		log.Fatalf("Snapshot index (%d) < last applied index (%d)\n", index, kv.lastApplied)
+	}
+	kv.lastApplied = index
 }
 
 func (kv *KVServer) Run() {
@@ -202,70 +293,27 @@ func (kv *KVServer) Run() {
 			return
 		case msg := <-kv.applyCh:
 			DPrintf("%d: %v applied\n", kv.me, msg.Command)
-			t := reflect.TypeOf(msg.Command)
-			if t == reflect.TypeOf(GetArgs{}) {
-				args := msg.Command.(GetArgs)
-				kv.mu.Lock()
-				sessionReply, ok := kv.replyBuf[args.SessionID]
-				if !ok || sessionReply.seq != args.Seq {
-					var reply GetReply
-					if v, ok := kv.kv[args.Key]; ok {
-						reply = GetReply{
-							Err:   OK,
-							Value: v,
-						}
-					} else {
-						reply = GetReply{
-							Err: ErrNoKey,
-						}
-					}
-					sessionReply = SessionReply{
-						seq:   args.Seq,
-						reply: reply,
-					}
-					kv.replyBuf[args.SessionID] = sessionReply
+			if msg.CommandValid {
+				if kv.lastApplied+1 != msg.CommandIndex {
+					log.Fatalf("lastApplied = %d, applied command index = %d\n", kv.lastApplied, msg.CommandIndex)
 				}
-				replyChan, ok := kv.replyChans[args.SessionID]
-				if ok {
-					delete(kv.replyChans, args.SessionID)
-					replyChan <- sessionReply // non-blocking
-				}
-				kv.mu.Unlock()
-			} else if t == reflect.TypeOf(PutAppendArgs{}) {
-				args := msg.Command.(PutAppendArgs)
-				kv.mu.Lock()
-				sessionReply, ok := kv.replyBuf[args.SessionID]
-				if !ok || sessionReply.seq != args.Seq {
-					if args.Op == "Append" {
-						if v, ok := kv.kv[args.Key]; ok {
-							v += args.Value
-							kv.kv[args.Key] = v
-						} else {
-							kv.kv[args.Key] = args.Value
-						}
-					} else if args.Op == "Put" {
-						kv.kv[args.Key] = args.Value
-					} else {
-						log.Fatalf("Unknown operator: %s\n", args.Op)
-					}
-					reply := PutAppendReply{
-						Err: OK,
-					}
-					sessionReply = SessionReply{
-						seq:   args.Seq,
-						reply: reply,
-					}
-					kv.replyBuf[args.SessionID] = sessionReply
-				}
-				replyChan, ok := kv.replyChans[args.SessionID]
-				if ok {
-					delete(kv.replyChans, args.SessionID)
-					replyChan <- sessionReply // non-blocking
-				}
-				kv.mu.Unlock()
+				kv.lastApplied = msg.CommandIndex
+				kv.handleAppliedCommand(&msg)
 			} else {
-				log.Fatalf("Unknown type of command: %s\n", t.Name())
+				if !msg.SnapshotValid {
+					log.Fatalln("Applied message not command nor snapshot!")
+				}
+				kv.installSnapshot(msg.SnapshotIndex, msg.Snapshot)
 			}
+		case persistedSize := <-kv.rf.PersistedSizeCh:
+			if kv.maxraftstate == -1 || persistedSize < kv.maxraftstate {
+				break
+			}
+			w := new(bytes.Buffer)
+			e := labgob.NewEncoder(w)
+			e.Encode(kv.kv)
+			snapshot := w.Bytes()
+			kv.rf.Snapshot(kv.lastApplied, snapshot)
 		}
 	}
 }
