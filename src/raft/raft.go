@@ -857,7 +857,7 @@ func (r *Replicator) run() {
 			r.NeedReplicate()
 			return
 		}
-		fmt.Printf("Replicator %d of %d: nextIndexLocal = %d\n", r.to, r.me, nextIndexLocal)
+		// fmt.Printf("Replicator %d of %d: nextIndexLocal = %d\n", r.to, r.me, nextIndexLocal)
 		args.PrevLogIndex = nextIndexLocal - 1
 		args.PrevLogTerm = r.rf.log[args.PrevLogIndex-r.rf.LogBaseIndex].Term
 
