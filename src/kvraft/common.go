@@ -4,7 +4,7 @@ const (
 	OK = "OK"
 	// There is a newer request with the same session ID and sequence number
 	ErrReplacedRequest = "ErrReplacedRequest"
-	// The request has been applied before and the apply has been remove from buffer.
+	// The request has been applied before but the reply has been remove from buffer.
 	ErrObsoleteRequest = "ErrObsoleteRequest"
 	ErrNoKey           = "ErrNoKey"
 	ErrWrongLeader     = "ErrWrongLeader"

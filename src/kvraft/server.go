@@ -21,8 +21,8 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 type SessionReply struct {
-	seq   int64
-	reply interface{}
+	Seq   int64
+	Reply interface{}
 }
 
 type KVServer struct {
@@ -48,11 +48,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	DPrintf("%d: RPC Get, %d %d, %s\n", kv.me, args.SessionID, args.Seq, args.Key)
 	kv.mu.Lock()
 	if buf, ok := kv.replyBuf[args.SessionID]; ok {
-		if buf.seq == args.Seq {
-			*reply = buf.reply.(GetReply)
+		if buf.Seq == args.Seq {
+			*reply = buf.Reply.(GetReply)
 			kv.mu.Unlock()
 			return
-		} else if buf.seq > args.Seq {
+		} else if buf.Seq > args.Seq {
 			kv.mu.Unlock()
 			*reply = GetReply{
 				Err: ErrObsoleteRequest,
@@ -83,10 +83,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	case <-kv.quit:
 		reply.Err = ErrWrongLeader
 	case r, ok := <-replyChan:
-		if !ok || r.seq != args.Seq {
+		if !ok || r.Seq != args.Seq {
 			reply.Err = ErrReplacedRequest
 		} else {
-			*reply = r.reply.(GetReply)
+			*reply = r.Reply.(GetReply)
 		}
 	}
 }
@@ -96,11 +96,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	DPrintf("%d: RPC PutAppend, %d %d, %s (%s) (%s)", kv.me, args.SessionID, args.Seq, args.Op, args.Key, args.Value)
 	kv.mu.Lock()
 	if buf, ok := kv.replyBuf[args.SessionID]; ok {
-		if buf.seq == args.Seq {
-			*reply = buf.reply.(PutAppendReply)
+		if buf.Seq == args.Seq {
+			*reply = buf.Reply.(PutAppendReply)
 			kv.mu.Unlock()
 			return
-		} else if buf.seq > args.Seq {
+		} else if buf.Seq > args.Seq {
 			kv.mu.Unlock()
 			*reply = PutAppendReply{
 				Err: OK,
@@ -131,10 +131,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	case <-kv.quit:
 		reply.Err = ErrWrongLeader
 	case r, ok := <-replyChan:
-		if !ok || r.seq != args.Seq {
+		if !ok || r.Seq != args.Seq {
 			reply.Err = ErrReplacedRequest
 		} else {
-			*reply = r.reply.(PutAppendReply)
+			*reply = r.Reply.(PutAppendReply)
 		}
 	}
 }
@@ -176,6 +176,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	labgob.Register(PutAppendArgs{})
 	labgob.Register(GetArgs{})
 	labgob.Register(map[string]string{})
+	labgob.Register(map[int64]SessionReply{})
+	labgob.Register(GetReply{})
+	labgob.Register(PutAppendReply{})
 
 	kv := new(KVServer)
 	kv.me = me
@@ -189,11 +192,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 
 	kv.replyChans = make(map[int64]chan SessionReply)
-	kv.replyBuf = make(map[int64]SessionReply)
 
 	snapshot := persister.ReadSnapshot()
 	if snapshot == nil || len(snapshot) == 0 {
 		kv.kv = make(map[string]string)
+		kv.replyBuf = make(map[int64]SessionReply)
 		kv.lastApplied = kv.rf.LogBaseIndex
 	} else {
 		kv.installSnapshot(kv.rf.LogBaseIndex, snapshot)
@@ -210,9 +213,10 @@ func (kv *KVServer) handleAppliedCommand(msg *raft.ApplyMsg) {
 	t := reflect.TypeOf(msg.Command)
 	if t == reflect.TypeOf(GetArgs{}) {
 		args := msg.Command.(GetArgs)
+		DPrintf("%d: Get (%s), %d %d, applied\n", kv.me, args.Key, args.SessionID, args.Seq)
 		kv.mu.Lock()
 		sessionReply, ok := kv.replyBuf[args.SessionID]
-		if !ok || sessionReply.seq != args.Seq {
+		if !ok || sessionReply.Seq != args.Seq {
 			var reply GetReply
 			if v, ok := kv.kv[args.Key]; ok {
 				reply = GetReply{
@@ -225,8 +229,8 @@ func (kv *KVServer) handleAppliedCommand(msg *raft.ApplyMsg) {
 				}
 			}
 			sessionReply = SessionReply{
-				seq:   args.Seq,
-				reply: reply,
+				Seq:   args.Seq,
+				Reply: reply,
 			}
 			kv.replyBuf[args.SessionID] = sessionReply
 		}
@@ -238,9 +242,10 @@ func (kv *KVServer) handleAppliedCommand(msg *raft.ApplyMsg) {
 		kv.mu.Unlock()
 	} else if t == reflect.TypeOf(PutAppendArgs{}) {
 		args := msg.Command.(PutAppendArgs)
+		DPrintf("%d: %s (%s) (%s), %d %d, applied\n", kv.me, args.Op, args.Key, args.Value, args.SessionID, args.Seq)
 		kv.mu.Lock()
 		sessionReply, ok := kv.replyBuf[args.SessionID]
-		if !ok || sessionReply.seq != args.Seq {
+		if !ok || sessionReply.Seq != args.Seq {
 			if args.Op == "Append" {
 				if v, ok := kv.kv[args.Key]; ok {
 					v += args.Value
@@ -257,8 +262,8 @@ func (kv *KVServer) handleAppliedCommand(msg *raft.ApplyMsg) {
 				Err: OK,
 			}
 			sessionReply = SessionReply{
-				seq:   args.Seq,
-				reply: reply,
+				Seq:   args.Seq,
+				Reply: reply,
 			}
 			kv.replyBuf[args.SessionID] = sessionReply
 		}
@@ -273,6 +278,24 @@ func (kv *KVServer) handleAppliedCommand(msg *raft.ApplyMsg) {
 	}
 }
 
+func crashIf(e error) {
+	if e != nil {
+		panic(e.Error())
+	}
+}
+
+func (kv *KVServer) makeSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	err := e.Encode(kv.kv)
+	crashIf(err)
+	kv.mu.Lock()
+	err = e.Encode(kv.replyBuf)
+	crashIf(err)
+	kv.mu.Unlock()
+	return w.Bytes()
+}
+
 func (kv *KVServer) installSnapshot(index int, snapshot []byte) {
 	if kv.lastApplied >= index {
 		// The snapshot is not newer. Just ignore it.
@@ -282,9 +305,12 @@ func (kv *KVServer) installSnapshot(index int, snapshot []byte) {
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 	err := d.Decode(&kv.kv)
-	if err != nil {
-		log.Fatalln(err.Error())
-	}
+	crashIf(err)
+
+	kv.mu.Lock()
+	err = d.Decode(&kv.replyBuf)
+	crashIf(err)
+	kv.mu.Unlock()
 }
 
 func (kv *KVServer) Run() {
@@ -293,7 +319,6 @@ func (kv *KVServer) Run() {
 		case <-kv.quit:
 			return
 		case msg := <-kv.applyCh:
-			DPrintf("%d: %v applied\n", kv.me, msg.Command)
 			if msg.CommandValid {
 				if kv.lastApplied+1 != msg.CommandIndex {
 					log.Fatalf("lastApplied = %d, applied command index = %d\n", kv.lastApplied, msg.CommandIndex)
@@ -310,11 +335,7 @@ func (kv *KVServer) Run() {
 			if kv.maxraftstate == -1 || persistedSize < kv.maxraftstate {
 				break
 			}
-			w := new(bytes.Buffer)
-			e := labgob.NewEncoder(w)
-			e.Encode(kv.kv)
-			snapshot := w.Bytes()
-			kv.rf.Snapshot(kv.lastApplied, snapshot)
+			kv.rf.Snapshot(kv.lastApplied, kv.makeSnapshot())
 		}
 	}
 }

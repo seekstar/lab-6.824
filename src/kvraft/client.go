@@ -62,8 +62,8 @@ func (ck *Clerk) Get(key string) string {
 		Seq:       seq,
 	}
 	reply := ck.PutCommand(GetRPC, &args).(GetReply)
+	DPrintf("%d: Get (%s) returns %s\n", ck.sessionID, key, reply.err())
 	if reply.err() == ErrNoKey {
-		DPrintf("%d: Get (%s) returns ErrNoKey\n", ck.sessionID, key)
 		return ""
 	}
 	if reply.err() != OK {
