@@ -838,6 +838,7 @@ func (r *Replicator) run() {
 			if ok {
 				mu.Lock()
 				nextIndex = log_base_index_local + 1
+				initialNextIndex = nextIndex
 				mu.Unlock()
 			}
 			// retry
@@ -877,6 +878,7 @@ func (r *Replicator) run() {
 			mu.Lock()
 			if nextIndexLocal > nextIndex {
 				nextIndex = nextIndexLocal
+				initialNextIndex = nextIndex
 			}
 			mu.Unlock()
 
@@ -897,6 +899,17 @@ func (r *Replicator) run() {
 			}
 			return
 		}
+		mu.Lock()
+		if initialNextIndex < nextIndexLocal {
+			// The replicating is successful for others. No need to retry
+			mu.Unlock()
+			return
+		}
+		if nextIndex < nextIndexLocal {
+			// Has been retried by someone else.
+			mu.Unlock()
+			return
+		}
 		delta := initialNextIndex - nextIndexLocal
 		if delta == 0 {
 			nextIndexLocal -= 1
@@ -906,7 +919,6 @@ func (r *Replicator) run() {
 		} else {
 			nextIndexLocal -= delta
 		}
-		mu.Lock()
 		nextIndex = nextIndexLocal
 		mu.Unlock()
 		DPrintf("Replicator %d of %d: Log inconsistency, decrease nextIndex to %d and retry\n", r.to, r.me, nextIndexLocal)
