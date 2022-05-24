@@ -798,7 +798,11 @@ func (r *Replicator) run() {
 	r.rf.mu.Unlock()
 	initialNextIndex := nextIndex
 
-	replicate := func() {
+	callingNotify := make(chan struct{})
+	calledNotify := make(chan struct{})
+	returnedNotify := make(chan struct{})
+
+	__replicate := func() {
 		args := &AppendEntriesArgs{
 			Term:     r.currentTerm,
 			LeaderId: r.me,
@@ -813,6 +817,8 @@ func (r *Replicator) run() {
 			log_base_index_local := r.rf.LogBaseIndex
 			snapshot_local := r.rf.snapshot
 			r.rf.mu.Unlock()
+
+			callingNotify <- struct{}{}
 			ok := r.rf.peers[r.to].Call(
 				"Raft.InstallSnapshot",
 				&SnapshotArgs{
@@ -822,6 +828,13 @@ func (r *Replicator) run() {
 				},
 				&struct{}{},
 			)
+			calledNotify <- struct{}{}
+			select {
+			case <-r.quit:
+				return
+			default:
+			}
+
 			if ok {
 				mu.Lock()
 				nextIndex = log_base_index_local + 1
@@ -846,7 +859,16 @@ func (r *Replicator) run() {
 
 		// Use go routine to make sure that replicator could close quickly without being blocked by RPC
 		reply := AppendEntriesReply{}
+
+		callingNotify <- struct{}{}
 		ok := r.rf.peers[r.to].Call("Raft.AppendEntries", args, &reply)
+		calledNotify <- struct{}{}
+		select {
+		case <-r.quit:
+			return
+		default:
+		}
+
 		if !ok {
 			return
 		}
@@ -891,22 +913,48 @@ func (r *Replicator) run() {
 		r.NeedReplicate()
 	}
 
+	replicate := func() {
+		__replicate()
+		returnedNotify <- struct{}{}
+	}
+
 	sent := false
+	calling := 0
+	running := 0
 	for {
 		select {
 		case <-r.quit:
+			DPrintf("%d: Replicator %d closing\n", r.me, r.to)
+			for calling < running {
+				select {
+				case <-callingNotify:
+					calling++
+				case <-calledNotify:
+					calling--
+				case <-returnedNotify:
+					running--
+				}
+			}
 			r.closed <- struct{}{}
 			DPrintf("%d: Replicator %d closed\n", r.me, r.to)
 			return
+		case <-callingNotify:
+			calling++
+		case <-calledNotify:
+			calling--
+		case <-returnedNotify:
+			running--
 		case <-heartbeat:
 			if sent {
 				sent = false
 				break
 			}
 			// Use go routine to make sure that the heartbeats are sent periodically even when the RPC call does not return.
+			running++
 			go replicate()
 		case <-r.need_replicate:
 			sent = true
+			running++
 			go replicate()
 		}
 	}
