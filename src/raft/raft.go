@@ -237,21 +237,27 @@ type SnapshotArgs struct {
 // because the snapshot is always committed.
 type InstallSnapshotChItem struct {
 	snapshot *SnapshotArgs
-	apply    bool
+	fromPeer bool
 	reply    chan struct{}
+}
+
+func (rf *Raft) SnapshotInstallable(args *InstallSnapshotChItem) bool {
+	snapshot := args.snapshot
+	if snapshot.Index > rf.LogBaseIndex {
+		DPrintf("%d: Snapshot %d installable\n", rf.me, snapshot.Index)
+		return true
+	}
+	DPrintf("%d: An old snapshot\n", rf.me)
+	select {
+	case <-rf.quit:
+	case args.reply <- struct{}{}:
+	}
+	return false
 }
 
 func (rf *Raft) InstallSnapshotRaw(args *InstallSnapshotChItem) {
 	snapshot := args.snapshot
 	DPrintf("%d: InstallSnapshotRaw, index = %d\n", rf.me, snapshot.Index)
-	if args.snapshot.Index <= rf.LogBaseIndex {
-		DPrintf("%d: An old snapshot\n", rf.me)
-		select {
-		case <-rf.quit:
-		case args.reply <- struct{}{}:
-		}
-		return
-	}
 	rf.snapshot = snapshot.Snapshot
 	if snapshot.Index-rf.LogBaseIndex < len(rf.log) && (snapshot.Term == 0 || rf.log[snapshot.Index-rf.LogBaseIndex].Term == snapshot.Term) {
 		rf.log = rf.log[snapshot.Index-rf.LogBaseIndex:]
@@ -262,7 +268,7 @@ func (rf *Raft) InstallSnapshotRaw(args *InstallSnapshotChItem) {
 	rf.commitIndex = MaxInt(rf.commitIndex, snapshot.Index)
 	rf.lastApplied = MaxInt(rf.lastApplied, snapshot.Index)
 	rf.persist()
-	if args.apply {
+	if args.fromPeer {
 		select {
 		case <-rf.quit:
 			return
@@ -272,6 +278,12 @@ func (rf *Raft) InstallSnapshotRaw(args *InstallSnapshotChItem) {
 	select {
 	case <-rf.quit:
 	case args.reply <- struct{}{}:
+	}
+}
+
+func (rf *Raft) CheckAndInstallSnapshot(args *InstallSnapshotChItem) {
+	if rf.SnapshotInstallable(args) {
+		rf.InstallSnapshotRaw(args)
 	}
 }
 
@@ -845,6 +857,7 @@ func (r *Replicator) run() {
 			r.NeedReplicate()
 			return
 		}
+		fmt.Printf("Replicator %d of %d: nextIndexLocal = %d\n", r.to, r.me, nextIndexLocal)
 		args.PrevLogIndex = nextIndexLocal - 1
 		args.PrevLogTerm = r.rf.log[args.PrevLogIndex-r.rf.LogBaseIndex].Term
 
@@ -1040,7 +1053,7 @@ func (rf *Raft) doFollower() int {
 			}
 			req.reply <- reply
 		case args := <-rf.installSnapshotCh:
-			rf.InstallSnapshotRaw(args)
+			rf.CheckAndInstallSnapshot(args)
 		}
 	}
 }
@@ -1113,7 +1126,18 @@ func (rf *Raft) doCandidate() int {
 			req.reply <- reply
 			return StateFollower
 		case args := <-rf.installSnapshotCh:
+			if !rf.SnapshotInstallable(args) {
+				break
+			}
+			if !args.fromPeer {
+				rf.InstallSnapshotRaw(args)
+				break
+			}
+			// New leader, convert to follower.
+			close(abort)
+			rf.updateTerm(args.snapshot.Term)
 			rf.InstallSnapshotRaw(args)
+			return StateFollower
 		case term := <-refused:
 			if rf.currentTerm < term {
 				// New term, convert to follower.
@@ -1236,8 +1260,25 @@ func (rf *Raft) doLeader() int {
 		case args := <-rf.installSnapshotCh:
 			DPrintf("%d: InstallSnapshotArgs received\n", rf.me)
 			rf.mu.Lock()
-			rf.InstallSnapshotRaw(args)
+			if !rf.SnapshotInstallable(args) {
+				rf.mu.Unlock()
+				break
+			}
+			if !args.fromPeer {
+				rf.InstallSnapshotRaw(args)
+				rf.mu.Unlock()
+				break
+			}
 			rf.mu.Unlock()
+			// New leader, convert to follower.
+			abort()
+			// Now I'm essentially a follower, so no need to lock
+			if !rf.SnapshotInstallable(args) {
+				panic("")
+			}
+			rf.updateTerm(args.snapshot.Term)
+			rf.InstallSnapshotRaw(args)
+			return StateFollower
 		}
 	}
 }
