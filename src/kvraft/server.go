@@ -43,16 +43,18 @@ type KVServer struct {
 	quit chan struct{}
 }
 
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+func (kv *KVServer) Get(rpc_args *RPCSessionArgs, reply *GetReply) {
 	// Your code here.
-	DPrintf("%d: RPC Get, %d %d, %s\n", kv.me, args.SessionID, args.Seq, args.Key)
+	// It seems that the pointer in RPCSessionArgs will become concrete struct
+	get_args := rpc_args.Args.(GetArgs)
+	DPrintf("%d: RPC Get, %d %d, %s\n", kv.me, rpc_args.SessionID, rpc_args.Seq, get_args.Key)
 	kv.mu.Lock()
-	if buf, ok := kv.replyBuf[args.SessionID]; ok {
-		if buf.Seq == args.Seq {
+	if buf, ok := kv.replyBuf[rpc_args.SessionID]; ok {
+		if buf.Seq == rpc_args.Seq {
 			*reply = buf.Reply.(GetReply)
 			kv.mu.Unlock()
 			return
-		} else if buf.Seq > args.Seq {
+		} else if buf.Seq > rpc_args.Seq {
 			kv.mu.Unlock()
 			*reply = GetReply{
 				Err: ErrObsoleteRequest,
@@ -61,16 +63,16 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		}
 	}
 	replyChan := make(chan SessionReply, 1)
-	if c, ok := kv.replyChans[args.SessionID]; ok {
+	if c, ok := kv.replyChans[rpc_args.SessionID]; ok {
 		close(c)
 	}
-	kv.replyChans[args.SessionID] = replyChan
+	kv.replyChans[rpc_args.SessionID] = replyChan
 	kv.mu.Unlock()
-	_, _, isLeader := kv.rf.Start(*args)
+	_, _, isLeader := kv.rf.Start(*rpc_args)
 	if !isLeader {
 		kv.mu.Lock()
-		if r, ok := kv.replyChans[args.SessionID]; ok && r == replyChan {
-			delete(kv.replyChans, args.SessionID)
+		if r, ok := kv.replyChans[rpc_args.SessionID]; ok && r == replyChan {
+			delete(kv.replyChans, rpc_args.SessionID)
 		} else {
 			// It has already been taken out.
 			// It's okay to not listen to it. It's non-blocking anyway.
@@ -83,7 +85,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	case <-kv.quit:
 		reply.Err = ErrWrongLeader
 	case r, ok := <-replyChan:
-		if !ok || r.Seq != args.Seq {
+		if !ok || r.Seq != rpc_args.Seq {
 			reply.Err = ErrReplacedRequest
 		} else {
 			*reply = r.Reply.(GetReply)
@@ -91,16 +93,18 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 }
 
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+func (kv *KVServer) PutAppend(rpc_args *RPCSessionArgs, reply *PutAppendReply) {
 	// Your code here.
-	DPrintf("%d: RPC PutAppend, %d %d, %s (%s) (%s)", kv.me, args.SessionID, args.Seq, args.Op, args.Key, args.Value)
+	// It seems that the pointer in RPCSessionArgs will become concrete struct
+	put_args := rpc_args.Args.(PutAppendArgs)
+	DPrintf("%d: RPC PutAppend, %d %d, %s (%s) (%s)", kv.me, rpc_args.SessionID, rpc_args.Seq, put_args.Op, put_args.Key, put_args.Value)
 	kv.mu.Lock()
-	if buf, ok := kv.replyBuf[args.SessionID]; ok {
-		if buf.Seq == args.Seq {
+	if buf, ok := kv.replyBuf[rpc_args.SessionID]; ok {
+		if buf.Seq == rpc_args.Seq {
 			*reply = buf.Reply.(PutAppendReply)
 			kv.mu.Unlock()
 			return
-		} else if buf.Seq > args.Seq {
+		} else if buf.Seq > rpc_args.Seq {
 			kv.mu.Unlock()
 			*reply = PutAppendReply{
 				Err: OK,
@@ -109,16 +113,16 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		}
 	}
 	replyChan := make(chan SessionReply, 1)
-	if c, ok := kv.replyChans[args.SessionID]; ok {
+	if c, ok := kv.replyChans[rpc_args.SessionID]; ok {
 		close(c)
 	}
-	kv.replyChans[args.SessionID] = replyChan
+	kv.replyChans[rpc_args.SessionID] = replyChan
 	kv.mu.Unlock()
-	_, _, isLeader := kv.rf.Start(*args)
+	_, _, isLeader := kv.rf.Start(*rpc_args)
 	if !isLeader {
 		kv.mu.Lock()
-		if r, ok := kv.replyChans[args.SessionID]; ok && r == replyChan {
-			delete(kv.replyChans, args.SessionID)
+		if r, ok := kv.replyChans[rpc_args.SessionID]; ok && r == replyChan {
+			delete(kv.replyChans, rpc_args.SessionID)
 		} else {
 			// It has already been taken out.
 			// It's okay to not listen to it. It's non-blocking anyway.
@@ -131,7 +135,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	case <-kv.quit:
 		reply.Err = ErrWrongLeader
 	case r, ok := <-replyChan:
-		if !ok || r.Seq != args.Seq {
+		if !ok || r.Seq != rpc_args.Seq {
 			reply.Err = ErrReplacedRequest
 		} else {
 			*reply = r.Reply.(PutAppendReply)
@@ -173,6 +177,7 @@ func (kv *KVServer) Kill() {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
+	labgob.Register(RPCSessionArgs{})
 	labgob.Register(PutAppendArgs{})
 	labgob.Register(GetArgs{})
 	labgob.Register(map[string]string{})
@@ -210,13 +215,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 }
 
 func (kv *KVServer) handleAppliedCommand(msg *raft.ApplyMsg) {
-	t := reflect.TypeOf(msg.Command)
+	rpc_args := msg.Command.(RPCSessionArgs)
+	t := reflect.TypeOf(rpc_args.Args)
 	if t == reflect.TypeOf(GetArgs{}) {
-		args := msg.Command.(GetArgs)
-		DPrintf("%d: Get (%s), %d %d, applied\n", kv.me, args.Key, args.SessionID, args.Seq)
+		args := rpc_args.Args.(GetArgs)
+		DPrintf("%d: Get (%s), %d %d, applied\n", kv.me, args.Key, rpc_args.SessionID, rpc_args.Seq)
 		kv.mu.Lock()
-		sessionReply, ok := kv.replyBuf[args.SessionID]
-		if !ok || sessionReply.Seq != args.Seq {
+		sessionReply, ok := kv.replyBuf[rpc_args.SessionID]
+		if !ok || sessionReply.Seq != rpc_args.Seq {
 			var reply GetReply
 			if v, ok := kv.kv[args.Key]; ok {
 				reply = GetReply{
@@ -229,23 +235,23 @@ func (kv *KVServer) handleAppliedCommand(msg *raft.ApplyMsg) {
 				}
 			}
 			sessionReply = SessionReply{
-				Seq:   args.Seq,
+				Seq:   rpc_args.Seq,
 				Reply: reply,
 			}
-			kv.replyBuf[args.SessionID] = sessionReply
+			kv.replyBuf[rpc_args.SessionID] = sessionReply
 		}
-		replyChan, ok := kv.replyChans[args.SessionID]
+		replyChan, ok := kv.replyChans[rpc_args.SessionID]
 		if ok {
-			delete(kv.replyChans, args.SessionID)
+			delete(kv.replyChans, rpc_args.SessionID)
 			replyChan <- sessionReply // non-blocking
 		}
 		kv.mu.Unlock()
 	} else if t == reflect.TypeOf(PutAppendArgs{}) {
-		args := msg.Command.(PutAppendArgs)
-		DPrintf("%d: %s (%s) (%s), %d %d, applied\n", kv.me, args.Op, args.Key, args.Value, args.SessionID, args.Seq)
+		args := rpc_args.Args.(PutAppendArgs)
+		DPrintf("%d: %s (%s) (%s), %d %d, applied\n", kv.me, args.Op, args.Key, args.Value, rpc_args.SessionID, rpc_args.Seq)
 		kv.mu.Lock()
-		sessionReply, ok := kv.replyBuf[args.SessionID]
-		if !ok || sessionReply.Seq != args.Seq {
+		sessionReply, ok := kv.replyBuf[rpc_args.SessionID]
+		if !ok || sessionReply.Seq != rpc_args.Seq {
 			if args.Op == "Append" {
 				if v, ok := kv.kv[args.Key]; ok {
 					v += args.Value
@@ -262,14 +268,14 @@ func (kv *KVServer) handleAppliedCommand(msg *raft.ApplyMsg) {
 				Err: OK,
 			}
 			sessionReply = SessionReply{
-				Seq:   args.Seq,
+				Seq:   rpc_args.Seq,
 				Reply: reply,
 			}
-			kv.replyBuf[args.SessionID] = sessionReply
+			kv.replyBuf[rpc_args.SessionID] = sessionReply
 		}
-		replyChan, ok := kv.replyChans[args.SessionID]
+		replyChan, ok := kv.replyChans[rpc_args.SessionID]
 		if ok {
-			delete(kv.replyChans, args.SessionID)
+			delete(kv.replyChans, rpc_args.SessionID)
 			replyChan <- sessionReply // non-blocking
 		}
 		kv.mu.Unlock()

@@ -1,5 +1,11 @@
 package kvraft
 
+type RPCSessionArgs struct {
+	SessionID int64
+	Seq       int64
+	Args      interface{}
+}
+
 const (
 	OK = "OK"
 	// There is a newer request with the same session ID and sequence number
@@ -20,8 +26,6 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	SessionID int64
-	Seq       int64
 }
 
 type PutAppendReply struct {
@@ -31,8 +35,6 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
-	SessionID int64
-	Seq       int64
 }
 
 type GetReply struct {
