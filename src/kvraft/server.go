@@ -64,7 +64,7 @@ func (ss *SessionServer) HandleRPC(rpc_args *RPCSessionArgs, do func(interface{}
 	replyChan := make(chan RPCSessionReply, 1)
 	ss.mu.Lock()
 	if original, ok := ss.replyChans[rpc_args.SessionID]; ok {
-		close(original.replyChan)
+		original.replyChan <- RPCSessionReply{Err: RPCErrReplacedRequest}
 	}
 	ss.replyChans[rpc_args.SessionID] = replyChanWithSeq{
 		seq:       rpc_args.Seq,
@@ -75,60 +75,56 @@ func (ss *SessionServer) HandleRPC(rpc_args *RPCSessionArgs, do func(interface{}
 	select {
 	case <-ss.quit:
 		reply.Err = RPCErrKilled
-	case r, ok := <-replyChan:
-		if ok {
-			reply = r
-		} else {
-			// The channel has been closed.
-			if ss.checkBuf(rpc_args, &reply, withRet) {
-				// It has been answered
-			} else {
-				// It has been replaced
-				reply.Err = RPCErrReplacedRequest
-			}
-		}
+	case reply = <-replyChan:
 	}
-	ss.mu.Lock()
-	if r, ok := ss.replyChans[rpc_args.SessionID]; ok && r.replyChan == replyChan {
-		delete(ss.replyChans, rpc_args.SessionID)
-	} else {
-		// It has already been take out by others
-	}
-	ss.mu.Unlock()
+	// replyChan will be removed from ss.replyChans by its writer
 	return
 }
 
 // exec will be called with ss.mu locked
-func (ss *SessionServer) HandleAppliedCommand(rpc_args *RPCSessionArgs, c interface{}, exec func(interface{}, interface{}) interface{}) {
+func (ss *SessionServer) HandleAppliedCommand(rpc_args *RPCSessionArgs, c interface{}, exec func(interface{}, interface{}) interface{}, withRet bool) {
 	ss.mu.Lock()
 	var replyChan chan RPCSessionReply
-	replyChanWithSeq, ok := ss.replyChans[rpc_args.SessionID]
-	if ok && replyChanWithSeq.seq == rpc_args.Seq {
-		replyChan = replyChanWithSeq.replyChan
-	} else {
-		replyChan = nil
-	}
-	// Hold the lock to make sure that replyChan will not be closed by others
+	replyChanWithSeq, replyChanOk := ss.replyChans[rpc_args.SessionID]
 	sessionReply, ok := ss.replyBuf[rpc_args.SessionID]
-	if ok && sessionReply.Seq >= rpc_args.Seq {
-		// It has been executed.
-		if replyChan != nil {
-			close(replyChan)
+	if replyChanOk && replyChanWithSeq.seq == rpc_args.Seq {
+		replyChan = replyChanWithSeq.replyChan
+		// Hold the lock to make sure that replyChan will not be closed by others
+		var reply RPCSessionReply
+		if ok && sessionReply.Seq >= rpc_args.Seq {
+			// It has been executed.
+			if sessionReply.Seq == rpc_args.Seq {
+				reply = sessionReply.Reply
+			} else if withRet {
+				reply = RPCSessionReply{Err: RPCErrObsoleteRequest}
+			} else {
+				reply = RPCSessionReply{Err: RPCOK}
+			}
+		} else {
+			reply = RPCSessionReply{
+				Err:   RPCOK,
+				Reply: exec(c, rpc_args.Args),
+			}
+			// Fill the buffer immediately to avoid multiple execution of the same request
+			ss.replyBuf[rpc_args.SessionID] = replyWithSeq{
+				Seq:   rpc_args.Seq,
+				Reply: reply,
+			}
 		}
-		ss.mu.Unlock()
-		return
-	}
-	reply := RPCSessionReply{
-		Err:   RPCOK,
-		Reply: exec(c, rpc_args.Args),
-	}
-	// Fill the buffer immediately to avoid multiple execution of the same request
-	ss.replyBuf[rpc_args.SessionID] = replyWithSeq{
-		Seq:   rpc_args.Seq,
-		Reply: reply,
-	}
-	if replyChan != nil {
 		replyChan <- reply // non-blocking
+		delete(ss.replyChans, rpc_args.SessionID)
+	} else {
+		if !ok || sessionReply.Seq < rpc_args.Seq {
+			reply := RPCSessionReply{
+				Err:   RPCOK,
+				Reply: exec(c, rpc_args.Args),
+			}
+			// Fill the buffer immediately to avoid multiple execution of the same request
+			ss.replyBuf[rpc_args.SessionID] = replyWithSeq{
+				Seq:   rpc_args.Seq,
+				Reply: reply,
+			}
+		}
 	}
 	ss.mu.Unlock()
 }
@@ -157,9 +153,11 @@ func raft_start(c interface{}, rpc_args *RPCSessionArgs, ss *SessionServer) {
 		ss.mu.Lock()
 		replyChanWithSeq, ok := ss.replyChans[rpc_args.SessionID]
 		if ok && replyChanWithSeq.seq == rpc_args.Seq {
+			// Non-blocking
 			replyChanWithSeq.replyChan <- RPCSessionReply{
 				Err: RPCErrWrongLeader,
 			}
+			delete(ss.replyChans, rpc_args.SessionID)
 		}
 		ss.mu.Unlock()
 	}
@@ -295,11 +293,11 @@ func (kv *KVServer) handleAppliedCommand(msg *raft.ApplyMsg) {
 	if t == reflect.TypeOf(GetArgs{}) {
 		args := rpc_args.Args.(GetArgs)
 		DPrintf("%d: Get (%s), %d %d, applied\n", kv.me, args.Key, rpc_args.SessionID, rpc_args.Seq)
-		ss.HandleAppliedCommand(&rpc_args, kv, execGet)
+		ss.HandleAppliedCommand(&rpc_args, kv, execGet, true)
 	} else if t == reflect.TypeOf(PutAppendArgs{}) {
 		args := rpc_args.Args.(PutAppendArgs)
 		DPrintf("%d: %s (%s) (%s), %d %d, applied\n", kv.me, args.Op, args.Key, args.Value, rpc_args.SessionID, rpc_args.Seq)
-		ss.HandleAppliedCommand(&rpc_args, kv, execPutAppend)
+		ss.HandleAppliedCommand(&rpc_args, kv, execPutAppend, false)
 	} else {
 		log.Fatalf("Unknown type of command: %s\n", t.Name())
 	}

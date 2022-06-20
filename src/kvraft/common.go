@@ -12,7 +12,7 @@ const (
 	RPCErrKilled
 	// The server is not a leader. The client should try another server.
 	RPCErrWrongLeader
-	// There is a newer request with the same session ID and sequence number
+	// There is a newer request with the same session ID
 	RPCErrReplacedRequest
 	// The request has been applied before but the reply has been removed from buffer.
 	RPCErrObsoleteRequest
