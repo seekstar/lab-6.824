@@ -21,8 +21,8 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 type replyWithSeq struct {
-	seq   int64
-	reply RPCSessionReply
+	Seq   int64
+	Reply RPCSessionReply
 }
 
 type replyChanWithSeq struct {
@@ -42,10 +42,10 @@ func (ss *SessionServer) checkBuf(rpc_args *RPCSessionArgs, reply *RPCSessionRep
 	buf, ok := ss.replyBuf[rpc_args.SessionID]
 	ss.mu.Unlock()
 	if ok {
-		if buf.seq == rpc_args.Seq {
-			*reply = buf.reply
+		if buf.Seq == rpc_args.Seq {
+			*reply = buf.Reply
 			return true
-		} else if buf.seq > rpc_args.Seq {
+		} else if buf.Seq > rpc_args.Seq {
 			if withRet {
 				reply.Err = RPCErrObsoleteRequest
 			} else {
@@ -110,7 +110,7 @@ func (ss *SessionServer) HandleAppliedCommand(rpc_args *RPCSessionArgs, c interf
 	}
 	// Hold the lock to make sure that replyChan will not be closed by others
 	sessionReply, ok := ss.replyBuf[rpc_args.SessionID]
-	if ok && sessionReply.seq >= rpc_args.Seq {
+	if ok && sessionReply.Seq >= rpc_args.Seq {
 		// It has been executed.
 		if replyChan != nil {
 			close(replyChan)
@@ -124,8 +124,8 @@ func (ss *SessionServer) HandleAppliedCommand(rpc_args *RPCSessionArgs, c interf
 	}
 	// Fill the buffer immediately to avoid multiple execution of the same request
 	ss.replyBuf[rpc_args.SessionID] = replyWithSeq{
-		seq:   rpc_args.Seq,
-		reply: reply,
+		Seq:   rpc_args.Seq,
+		Reply: reply,
 	}
 	if replyChan != nil {
 		replyChan <- reply // non-blocking
