@@ -9,12 +9,24 @@ import (
 	"6.824/labrpc"
 )
 
-type Clerk struct {
-	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+type SessionClient struct {
 	sessionID   int64
 	seqTop      int64
 	knownLeader int64
+	serverNum   int64
+}
+
+func InitSessionClient(sc *SessionClient, serverNum int64) {
+	sc.sessionID = nrand()
+	sc.seqTop = 0
+	sc.knownLeader = 0
+	sc.serverNum = serverNum
+}
+
+type Clerk struct {
+	servers []*labrpc.ClientEnd
+	// You will have to modify this struct.
+	sc SessionClient
 }
 
 func nrand() int64 {
@@ -24,18 +36,16 @@ func nrand() int64 {
 	return x
 }
 
-func (ck *Clerk) NewSeq() int64 {
-	ck.seqTop += 1
-	return ck.seqTop
+func (sc *SessionClient) NewSeq() int64 {
+	sc.seqTop += 1
+	return sc.seqTop
 }
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
-	ck.sessionID = nrand()
-	ck.seqTop = 0
-	ck.knownLeader = 0
+	InitSessionClient(&ck.sc, int64(len(ck.servers)))
 	return ck
 }
 
@@ -54,16 +64,16 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	DPrintf("%d: Get (%s)\n", ck.sessionID, key)
-	reply := ck.PutCommand(GetRPC, GetArgs{Key: key}).(GetReply)
-	DPrintf("%d: Get (%s) returns %s\n", ck.sessionID, key, reply.err())
+	DPrintf("%d: Get (%s)\n", ck.sc.sessionID, key)
+	reply := ck.sc.PutCommand(GetRPC, ck, GetArgs{Key: key}).(GetReply)
+	DPrintf("%d: Get (%s) returns %s\n", ck.sc.sessionID, key, reply.err())
 	if reply.err() == ErrNoKey {
 		return ""
 	}
 	if reply.err() != OK {
-		log.Fatalf("%d: Unexpected error in reply: %s\n", ck.sessionID, reply.err())
+		log.Fatalf("%d: Unexpected error in reply: %s\n", ck.sc.sessionID, reply.err())
 	}
-	DPrintf("%d: Get (%s) returns (%s)\n", ck.sessionID, key, reply.Value)
+	DPrintf("%d: Get (%s) returns (%s)\n", ck.sc.sessionID, key, reply.Value)
 	return reply.Value
 }
 
@@ -79,8 +89,9 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	reply := ck.PutCommand(
+	reply := ck.sc.PutCommand(
 		PutAppendRPC,
+		ck,
 		PutAppendArgs{
 			Key:   key,
 			Value: value,
@@ -88,17 +99,17 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		},
 	).(PutAppendReply)
 	if reply.err() != OK {
-		log.Fatalf("%d: Unexpected error in reply: %s\n", ck.sessionID, reply.err())
+		log.Fatalf("%d: Unexpected error in reply: %s\n", ck.sc.sessionID, reply.err())
 	}
-	DPrintf("%d: %s (%s) (%s) done\n", ck.sessionID, op, key, value)
+	DPrintf("%d: %s (%s) (%s) done\n", ck.sc.sessionID, op, key, value)
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	DPrintf("%d: Put (%s) (%s)\n", ck.sessionID, key, value)
+	DPrintf("%d: Put (%s) (%s)\n", ck.sc.sessionID, key, value)
 	ck.PutAppend(key, value, "Put")
 }
 func (ck *Clerk) Append(key string, value string) {
-	DPrintf("%d: Append (%s) (%s)\n", ck.sessionID, key, value)
+	DPrintf("%d: Append (%s) (%s)\n", ck.sc.sessionID, key, value)
 	ck.PutAppend(key, value, "Append")
 }
 
@@ -112,9 +123,10 @@ type RPCReply struct {
 	reply Reply
 }
 
-func GetRPC(ck *Clerk, i int64, args *RPCSessionArgs) RPCReply {
+func GetRPC(c interface{}, i int64, args *RPCSessionArgs) RPCReply {
+	ck := c.(*Clerk)
 	var reply GetReply
-	DPrintf("%d: Calling %d KVServer.Get\n", ck.sessionID, i)
+	DPrintf("%d: Calling %d KVServer.Get\n", ck.sc.sessionID, i)
 	ok := ck.servers[i].Call("KVServer.Get", args, &reply)
 	return RPCReply{
 		ok,
@@ -122,9 +134,10 @@ func GetRPC(ck *Clerk, i int64, args *RPCSessionArgs) RPCReply {
 	}
 }
 
-func PutAppendRPC(ck *Clerk, i int64, args *RPCSessionArgs) RPCReply {
+func PutAppendRPC(c interface{}, i int64, args *RPCSessionArgs) RPCReply {
+	ck := c.(*Clerk)
 	var reply PutAppendReply
-	DPrintf("%d: Calling %d KVServer.PutAppend\n", ck.sessionID, i)
+	DPrintf("%d: Calling %d KVServer.PutAppend\n", ck.sc.sessionID, i)
 	ok := ck.servers[i].Call("KVServer.PutAppend", args, &reply)
 	return RPCReply{
 		ok,
@@ -132,8 +145,8 @@ func PutAppendRPC(ck *Clerk, i int64, args *RPCSessionArgs) RPCReply {
 	}
 }
 
-func (ck *Clerk) CallRPC(rpc func(*Clerk, int64, *RPCSessionArgs) RPCReply, i int64, args *RPCSessionArgs, resChan chan PutCommandRes, abort chan struct{}) {
-	rpcreply := rpc(ck, i, args)
+func CallRPC(rpc func(interface{}, int64, *RPCSessionArgs) RPCReply, c interface{}, i int64, args *RPCSessionArgs, resChan chan PutCommandRes, abort chan struct{}) {
+	rpcreply := rpc(c, i, args)
 	if !rpcreply.ok {
 		// Assume that the outer logic has already been trying another server
 		return
@@ -152,18 +165,18 @@ func (ck *Clerk) CallRPC(rpc func(*Clerk, int64, *RPCSessionArgs) RPCReply, i in
 	}
 }
 
-func (ck *Clerk) PutCommand(rpc func(*Clerk, int64, *RPCSessionArgs) RPCReply, args interface{}) Reply {
-	seq := ck.NewSeq()
+func (sc *SessionClient) PutCommand(rpc func(interface{}, int64, *RPCSessionArgs) RPCReply, c interface{}, args interface{}) Reply {
+	seq := sc.NewSeq()
 	rpc_args := RPCSessionArgs{
-		SessionID: ck.sessionID,
+		SessionID: sc.sessionID,
 		Seq:       seq,
 		Args:      args,
 	}
 	resChan := make(chan PutCommandRes)
 	abort := make(chan struct{})
-	i := ck.knownLeader
+	i := sc.knownLeader
 	for {
-		go ck.CallRPC(rpc, i, &rpc_args, resChan, abort)
+		go CallRPC(rpc, c, i, &rpc_args, resChan, abort)
 		select {
 		case <-time.After(time.Millisecond * 500):
 			DPrintf("Timeout\n")
@@ -172,9 +185,9 @@ func (ck *Clerk) PutCommand(rpc func(*Clerk, int64, *RPCSessionArgs) RPCReply, a
 				break
 			}
 			close(abort)
-			ck.knownLeader = res.from
+			sc.knownLeader = res.from
 			return res.reply
 		}
-		i = (i + 1) % int64(len(ck.servers))
+		i = (i + 1) % sc.serverNum
 	}
 }
