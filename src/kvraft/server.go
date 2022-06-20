@@ -57,7 +57,7 @@ func (ss *SessionServer) checkBuf(rpc_args *RPCSessionArgs, reply *RPCSessionRep
 	return false
 }
 
-func (ss *SessionServer) HandleRPC(rpc_args *RPCSessionArgs, do func(interface{}, *RPCSessionArgs, *SessionServer), c interface{}, withRet bool) (reply RPCSessionReply) {
+func (ss *SessionServer) HandleRPC(rpc_args *RPCSessionArgs, do func(interface{}, *RPCSessionArgs, *SessionServer) int, c interface{}, withRet bool) (reply RPCSessionReply) {
 	if ss.checkBuf(rpc_args, &reply, withRet) {
 		return
 	}
@@ -71,7 +71,16 @@ func (ss *SessionServer) HandleRPC(rpc_args *RPCSessionArgs, do func(interface{}
 		replyChan: replyChan,
 	}
 	ss.mu.Unlock()
-	do(c, rpc_args, ss)
+	reply.Err = do(c, rpc_args, ss)
+	if reply.Err != RPCOK {
+		ss.mu.Lock()
+		replyChanWithSeq, ok := ss.replyChans[rpc_args.SessionID]
+		if ok && replyChanWithSeq.seq == rpc_args.Seq {
+			delete(ss.replyChans, rpc_args.SessionID)
+		}
+		ss.mu.Unlock()
+		return
+	}
 	select {
 	case <-ss.quit:
 		reply.Err = RPCErrKilled
@@ -145,22 +154,14 @@ type KVServer struct {
 	quit chan struct{}
 }
 
-func raft_start(c interface{}, rpc_args *RPCSessionArgs, ss *SessionServer) {
+func raft_start(c interface{}, rpc_args *RPCSessionArgs, ss *SessionServer) int {
 	kv := c.(*KVServer)
 	// TODO: Search in the log first to avoid appending the same request multiple times to the Raft log.
 	_, _, isLeader := kv.rf.Start(*rpc_args)
 	if !isLeader {
-		ss.mu.Lock()
-		replyChanWithSeq, ok := ss.replyChans[rpc_args.SessionID]
-		if ok && replyChanWithSeq.seq == rpc_args.Seq {
-			// Non-blocking
-			replyChanWithSeq.replyChan <- RPCSessionReply{
-				Err: RPCErrWrongLeader,
-			}
-			delete(ss.replyChans, rpc_args.SessionID)
-		}
-		ss.mu.Unlock()
+		return RPCErrWrongLeader
 	}
+	return RPCOK
 }
 
 func (kv *KVServer) Get(rpc_args *RPCSessionArgs, reply *RPCSessionReply) {
