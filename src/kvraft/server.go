@@ -20,9 +20,117 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-type SessionReply struct {
-	Seq   int64
-	Reply interface{}
+type replyWithSeq struct {
+	seq   int64
+	reply RPCSessionReply
+}
+
+type replyChanWithSeq struct {
+	seq       int64
+	replyChan chan RPCSessionReply
+}
+
+type SessionServer struct {
+	mu         sync.Mutex
+	replyChans map[int64]replyChanWithSeq
+	replyBuf   map[int64]replyWithSeq
+	quit       chan struct{}
+}
+
+func (ss *SessionServer) checkBuf(rpc_args *RPCSessionArgs, reply *RPCSessionReply, withRet bool) bool {
+	ss.mu.Lock()
+	buf, ok := ss.replyBuf[rpc_args.SessionID]
+	ss.mu.Unlock()
+	if ok {
+		if buf.seq == rpc_args.Seq {
+			*reply = buf.reply
+			return true
+		} else if buf.seq > rpc_args.Seq {
+			if withRet {
+				reply.Err = RPCErrObsoleteRequest
+			} else {
+				reply.Err = RPCOK
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func (ss *SessionServer) HandleRPC(rpc_args *RPCSessionArgs, do func(interface{}, *RPCSessionArgs, *SessionServer), c interface{}, withRet bool) (reply RPCSessionReply) {
+	if ss.checkBuf(rpc_args, &reply, withRet) {
+		return
+	}
+	replyChan := make(chan RPCSessionReply, 1)
+	ss.mu.Lock()
+	if original, ok := ss.replyChans[rpc_args.SessionID]; ok {
+		close(original.replyChan)
+	}
+	ss.replyChans[rpc_args.SessionID] = replyChanWithSeq{
+		seq:       rpc_args.Seq,
+		replyChan: replyChan,
+	}
+	ss.mu.Unlock()
+	do(c, rpc_args, ss)
+	select {
+	case <-ss.quit:
+		reply.Err = RPCErrKilled
+	case r, ok := <-replyChan:
+		if ok {
+			reply = r
+		} else {
+			// The channel has been closed.
+			if ss.checkBuf(rpc_args, &reply, withRet) {
+				// It has been answered
+			} else {
+				// It has been replaced
+				reply.Err = RPCErrReplacedRequest
+			}
+		}
+	}
+	ss.mu.Lock()
+	if r, ok := ss.replyChans[rpc_args.SessionID]; ok && r.replyChan == replyChan {
+		delete(ss.replyChans, rpc_args.SessionID)
+	} else {
+		// It has already been take out by others
+	}
+	ss.mu.Unlock()
+	return
+}
+
+// exec will be called with ss.mu locked
+func (ss *SessionServer) HandleAppliedCommand(rpc_args *RPCSessionArgs, c interface{}, exec func(interface{}, interface{}) interface{}) {
+	ss.mu.Lock()
+	var replyChan chan RPCSessionReply
+	replyChanWithSeq, ok := ss.replyChans[rpc_args.SessionID]
+	if ok && replyChanWithSeq.seq == rpc_args.Seq {
+		replyChan = replyChanWithSeq.replyChan
+	} else {
+		replyChan = nil
+	}
+	// Hold the lock to make sure that replyChan will not be closed by others
+	sessionReply, ok := ss.replyBuf[rpc_args.SessionID]
+	if ok && sessionReply.seq >= rpc_args.Seq {
+		// It has been executed.
+		if replyChan != nil {
+			close(replyChan)
+		}
+		ss.mu.Unlock()
+		return
+	}
+	reply := RPCSessionReply{
+		Err:   RPCOK,
+		Reply: exec(c, rpc_args.Args),
+	}
+	// Fill the buffer immediately to avoid multiple execution of the same request
+	ss.replyBuf[rpc_args.SessionID] = replyWithSeq{
+		seq:   rpc_args.Seq,
+		reply: reply,
+	}
+	if replyChan != nil {
+		replyChan <- reply // non-blocking
+	}
+	ss.mu.Unlock()
 }
 
 type KVServer struct {
@@ -33,9 +141,7 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	mu         sync.Mutex
-	replyChans map[int64]chan SessionReply
-	replyBuf   map[int64]SessionReply
+	ss SessionServer
 
 	kv          map[string]string
 	lastApplied int
@@ -43,104 +149,35 @@ type KVServer struct {
 	quit chan struct{}
 }
 
-func (kv *KVServer) Get(rpc_args *RPCSessionArgs, reply *GetReply) {
+func raft_start(c interface{}, rpc_args *RPCSessionArgs, ss *SessionServer) {
+	kv := c.(*KVServer)
+	// TODO: Search in the log first to avoid appending the same request multiple times to the Raft log.
+	_, _, isLeader := kv.rf.Start(*rpc_args)
+	if !isLeader {
+		ss.mu.Lock()
+		replyChanWithSeq, ok := ss.replyChans[rpc_args.SessionID]
+		if ok && replyChanWithSeq.seq == rpc_args.Seq {
+			replyChanWithSeq.replyChan <- RPCSessionReply{
+				Err: RPCErrWrongLeader,
+			}
+		}
+		ss.mu.Unlock()
+	}
+}
+
+func (kv *KVServer) Get(rpc_args *RPCSessionArgs, reply *RPCSessionReply) {
 	// Your code here.
 	// It seems that the pointer in RPCSessionArgs will become concrete struct
 	get_args := rpc_args.Args.(GetArgs)
 	DPrintf("%d: RPC Get, %d %d, %s\n", kv.me, rpc_args.SessionID, rpc_args.Seq, get_args.Key)
-	kv.mu.Lock()
-	if buf, ok := kv.replyBuf[rpc_args.SessionID]; ok {
-		if buf.Seq == rpc_args.Seq {
-			*reply = buf.Reply.(GetReply)
-			kv.mu.Unlock()
-			return
-		} else if buf.Seq > rpc_args.Seq {
-			kv.mu.Unlock()
-			*reply = GetReply{
-				Err: ErrObsoleteRequest,
-			}
-			return
-		}
-	}
-	replyChan := make(chan SessionReply, 1)
-	if c, ok := kv.replyChans[rpc_args.SessionID]; ok {
-		close(c)
-	}
-	kv.replyChans[rpc_args.SessionID] = replyChan
-	kv.mu.Unlock()
-	_, _, isLeader := kv.rf.Start(*rpc_args)
-	if !isLeader {
-		kv.mu.Lock()
-		if r, ok := kv.replyChans[rpc_args.SessionID]; ok && r == replyChan {
-			delete(kv.replyChans, rpc_args.SessionID)
-		} else {
-			// It has already been taken out.
-			// It's okay to not listen to it. It's non-blocking anyway.
-		}
-		kv.mu.Unlock()
-		reply.Err = ErrWrongLeader
-		return
-	}
-	select {
-	case <-kv.quit:
-		reply.Err = ErrWrongLeader
-	case r, ok := <-replyChan:
-		if !ok || r.Seq != rpc_args.Seq {
-			reply.Err = ErrReplacedRequest
-		} else {
-			*reply = r.Reply.(GetReply)
-		}
-	}
+	*reply = kv.ss.HandleRPC(rpc_args, raft_start, kv, true)
 }
 
-func (kv *KVServer) PutAppend(rpc_args *RPCSessionArgs, reply *PutAppendReply) {
+func (kv *KVServer) PutAppend(rpc_args *RPCSessionArgs, reply *RPCSessionReply) {
 	// Your code here.
-	// It seems that the pointer in RPCSessionArgs will become concrete struct
 	put_args := rpc_args.Args.(PutAppendArgs)
 	DPrintf("%d: RPC PutAppend, %d %d, %s (%s) (%s)", kv.me, rpc_args.SessionID, rpc_args.Seq, put_args.Op, put_args.Key, put_args.Value)
-	kv.mu.Lock()
-	if buf, ok := kv.replyBuf[rpc_args.SessionID]; ok {
-		if buf.Seq == rpc_args.Seq {
-			*reply = buf.Reply.(PutAppendReply)
-			kv.mu.Unlock()
-			return
-		} else if buf.Seq > rpc_args.Seq {
-			kv.mu.Unlock()
-			*reply = PutAppendReply{
-				Err: OK,
-			}
-			return
-		}
-	}
-	replyChan := make(chan SessionReply, 1)
-	if c, ok := kv.replyChans[rpc_args.SessionID]; ok {
-		close(c)
-	}
-	kv.replyChans[rpc_args.SessionID] = replyChan
-	kv.mu.Unlock()
-	_, _, isLeader := kv.rf.Start(*rpc_args)
-	if !isLeader {
-		kv.mu.Lock()
-		if r, ok := kv.replyChans[rpc_args.SessionID]; ok && r == replyChan {
-			delete(kv.replyChans, rpc_args.SessionID)
-		} else {
-			// It has already been taken out.
-			// It's okay to not listen to it. It's non-blocking anyway.
-		}
-		kv.mu.Unlock()
-		reply.Err = ErrWrongLeader
-		return
-	}
-	select {
-	case <-kv.quit:
-		reply.Err = ErrWrongLeader
-	case r, ok := <-replyChan:
-		if !ok || r.Seq != rpc_args.Seq {
-			reply.Err = ErrReplacedRequest
-		} else {
-			*reply = r.Reply.(PutAppendReply)
-		}
-	}
+	*reply = kv.ss.HandleRPC(rpc_args, raft_start, kv, false)
 }
 
 //
@@ -181,7 +218,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	labgob.Register(PutAppendArgs{})
 	labgob.Register(GetArgs{})
 	labgob.Register(map[string]string{})
-	labgob.Register(map[int64]SessionReply{})
+	labgob.Register(map[int64]RPCSessionReply{})
 	labgob.Register(GetReply{})
 	labgob.Register(PutAppendReply{})
 
@@ -196,89 +233,73 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
-	kv.replyChans = make(map[int64]chan SessionReply)
+	ss := &kv.ss
+	ss.replyChans = make(map[int64]replyChanWithSeq)
 
 	snapshot := persister.ReadSnapshot()
 	if snapshot == nil || len(snapshot) == 0 {
 		kv.kv = make(map[string]string)
-		kv.replyBuf = make(map[int64]SessionReply)
+		ss.replyBuf = make(map[int64]replyWithSeq)
 		kv.lastApplied = kv.rf.LogBaseIndex
 	} else {
 		kv.installSnapshot(kv.rf.LogBaseIndex, snapshot)
 	}
 
 	kv.quit = make(chan struct{})
+	ss.quit = kv.quit
 
 	go kv.Run()
 
 	return kv
 }
 
+func execGet(c interface{}, a interface{}) interface{} {
+	kv := c.(*KVServer)
+	args := a.(GetArgs)
+	var getReply GetReply
+	if v, ok := kv.kv[args.Key]; ok {
+		getReply = GetReply{
+			Err:   OK,
+			Value: v,
+		}
+	} else {
+		getReply = GetReply{
+			Err: ErrNoKey,
+		}
+	}
+	return getReply
+}
+
+func execPutAppend(c interface{}, a interface{}) interface{} {
+	kv := c.(*KVServer)
+	args := a.(PutAppendArgs)
+	if args.Op == "Append" {
+		if v, ok := kv.kv[args.Key]; ok {
+			v += args.Value
+			kv.kv[args.Key] = v
+		} else {
+			kv.kv[args.Key] = args.Value
+		}
+	} else if args.Op == "Put" {
+		kv.kv[args.Key] = args.Value
+	} else {
+		log.Fatalf("Unknown operator: %s\n", args.Op)
+	}
+	return nil
+}
+
 func (kv *KVServer) handleAppliedCommand(msg *raft.ApplyMsg) {
+	ss := &kv.ss
 	rpc_args := msg.Command.(RPCSessionArgs)
 	t := reflect.TypeOf(rpc_args.Args)
 	if t == reflect.TypeOf(GetArgs{}) {
 		args := rpc_args.Args.(GetArgs)
 		DPrintf("%d: Get (%s), %d %d, applied\n", kv.me, args.Key, rpc_args.SessionID, rpc_args.Seq)
-		kv.mu.Lock()
-		sessionReply, ok := kv.replyBuf[rpc_args.SessionID]
-		if !ok || sessionReply.Seq != rpc_args.Seq {
-			var reply GetReply
-			if v, ok := kv.kv[args.Key]; ok {
-				reply = GetReply{
-					Err:   OK,
-					Value: v,
-				}
-			} else {
-				reply = GetReply{
-					Err: ErrNoKey,
-				}
-			}
-			sessionReply = SessionReply{
-				Seq:   rpc_args.Seq,
-				Reply: reply,
-			}
-			kv.replyBuf[rpc_args.SessionID] = sessionReply
-		}
-		replyChan, ok := kv.replyChans[rpc_args.SessionID]
-		if ok {
-			delete(kv.replyChans, rpc_args.SessionID)
-			replyChan <- sessionReply // non-blocking
-		}
-		kv.mu.Unlock()
+		ss.HandleAppliedCommand(&rpc_args, kv, execGet)
 	} else if t == reflect.TypeOf(PutAppendArgs{}) {
 		args := rpc_args.Args.(PutAppendArgs)
 		DPrintf("%d: %s (%s) (%s), %d %d, applied\n", kv.me, args.Op, args.Key, args.Value, rpc_args.SessionID, rpc_args.Seq)
-		kv.mu.Lock()
-		sessionReply, ok := kv.replyBuf[rpc_args.SessionID]
-		if !ok || sessionReply.Seq != rpc_args.Seq {
-			if args.Op == "Append" {
-				if v, ok := kv.kv[args.Key]; ok {
-					v += args.Value
-					kv.kv[args.Key] = v
-				} else {
-					kv.kv[args.Key] = args.Value
-				}
-			} else if args.Op == "Put" {
-				kv.kv[args.Key] = args.Value
-			} else {
-				log.Fatalf("Unknown operator: %s\n", args.Op)
-			}
-			reply := PutAppendReply{
-				Err: OK,
-			}
-			sessionReply = SessionReply{
-				Seq:   rpc_args.Seq,
-				Reply: reply,
-			}
-			kv.replyBuf[rpc_args.SessionID] = sessionReply
-		}
-		replyChan, ok := kv.replyChans[rpc_args.SessionID]
-		if ok {
-			delete(kv.replyChans, rpc_args.SessionID)
-			replyChan <- sessionReply // non-blocking
-		}
-		kv.mu.Unlock()
+		ss.HandleAppliedCommand(&rpc_args, kv, execPutAppend)
 	} else {
 		log.Fatalf("Unknown type of command: %s\n", t.Name())
 	}
@@ -295,10 +316,10 @@ func (kv *KVServer) makeSnapshot() []byte {
 	e := labgob.NewEncoder(w)
 	err := e.Encode(kv.kv)
 	crashIf(err)
-	kv.mu.Lock()
-	err = e.Encode(kv.replyBuf)
+	kv.ss.mu.Lock()
+	err = e.Encode(kv.ss.replyBuf)
 	crashIf(err)
-	kv.mu.Unlock()
+	kv.ss.mu.Unlock()
 	return w.Bytes()
 }
 
@@ -313,10 +334,10 @@ func (kv *KVServer) installSnapshot(index int, snapshot []byte) {
 	err := d.Decode(&kv.kv)
 	crashIf(err)
 
-	kv.mu.Lock()
-	err = d.Decode(&kv.replyBuf)
+	kv.ss.mu.Lock()
+	err = d.Decode(&kv.ss.replyBuf)
 	crashIf(err)
-	kv.mu.Unlock()
+	kv.ss.mu.Unlock()
 }
 
 func (kv *KVServer) Run() {

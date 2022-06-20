@@ -7,13 +7,25 @@ type RPCSessionArgs struct {
 }
 
 const (
-	OK = "OK"
+	RPCOK int = iota
+	// The server has been killed
+	RPCErrKilled
+	// The server is not a leader. The client should try another server.
+	RPCErrWrongLeader
 	// There is a newer request with the same session ID and sequence number
-	ErrReplacedRequest = "ErrReplacedRequest"
-	// The request has been applied before but the reply has been remove from buffer.
-	ErrObsoleteRequest = "ErrObsoleteRequest"
-	ErrNoKey           = "ErrNoKey"
-	ErrWrongLeader     = "ErrWrongLeader"
+	RPCErrReplacedRequest
+	// The request has been applied before but the reply has been removed from buffer.
+	RPCErrObsoleteRequest
+)
+
+type RPCSessionReply struct {
+	Err   int
+	Reply interface{}
+}
+
+const (
+	OK       = "OK"
+	ErrNoKey = "ErrNoKey"
 )
 
 type Err string
@@ -40,16 +52,4 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
-}
-
-type Reply interface {
-	err() Err
-}
-
-func (r GetReply) err() Err {
-	return r.Err
-}
-
-func (r PutAppendReply) err() Err {
-	return r.Err
 }

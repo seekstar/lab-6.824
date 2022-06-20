@@ -21,6 +21,7 @@ func InitSessionClient(sc *SessionClient, serverNum int64) {
 	sc.seqTop = 0
 	sc.knownLeader = 0
 	sc.serverNum = serverNum
+	DPrintf("New session: %d\n", sc.sessionID)
 }
 
 type Clerk struct {
@@ -65,13 +66,20 @@ func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
 	DPrintf("%d: Get (%s)\n", ck.sc.sessionID, key)
-	reply := ck.sc.PutCommand(GetRPC, ck, GetArgs{Key: key}).(GetReply)
-	DPrintf("%d: Get (%s) returns %s\n", ck.sc.sessionID, key, reply.err())
-	if reply.err() == ErrNoKey {
+	rpc_reply := ck.sc.PutCommand(GetRPC, ck, GetArgs{Key: key})
+	if rpc_reply.Err == RPCErrKilled {
+		log.Fatalf("%d: Get (%s) returns RPCErrKilled\n", ck.sc.sessionID, key)
+	}
+	if rpc_reply.Err != RPCOK {
+		log.Fatalf("%d: Get (%s) returns unexpected RPC error: %d\n", ck.sc.sessionID, key, rpc_reply.Err)
+	}
+	reply := rpc_reply.Reply.(GetReply)
+	if reply.Err == ErrNoKey {
+		DPrintf("%d: Get (%s) returns %s\n", ck.sc.sessionID, key, reply.Err)
 		return ""
 	}
-	if reply.err() != OK {
-		log.Fatalf("%d: Unexpected error in reply: %s\n", ck.sc.sessionID, reply.err())
+	if reply.Err != OK {
+		log.Fatalf("%d: Unexpected error in reply: %s\n", ck.sc.sessionID, reply.Err)
 	}
 	DPrintf("%d: Get (%s) returns (%s)\n", ck.sc.sessionID, key, reply.Value)
 	return reply.Value
@@ -89,7 +97,8 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	reply := ck.sc.PutCommand(
+	DPrintf("%d: %s (%s) (%s)\n", ck.sc.sessionID, op, key, value)
+	rpc_reply := ck.sc.PutCommand(
 		PutAppendRPC,
 		ck,
 		PutAppendArgs{
@@ -97,35 +106,40 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			Value: value,
 			Op:    op,
 		},
-	).(PutAppendReply)
-	if reply.err() != OK {
-		log.Fatalf("%d: Unexpected error in reply: %s\n", ck.sc.sessionID, reply.err())
+	)
+	if rpc_reply.Err == RPCErrKilled {
+		log.Fatalf("%d: %s (%s) (%s) returns RPCErrKilled\n", ck.sc.sessionID, op, key, value)
+	}
+	if rpc_reply.Err != RPCOK {
+		log.Fatalf("%d: %s (%s) (%s) returns unexpected RPC error: %d\n", ck.sc.sessionID, op, key, value, rpc_reply.Err)
+	}
+	reply := rpc_reply.Reply
+	if reply != nil {
+		log.Fatalf("%d: %s (%s) (%s) reply non-nil value: %v\n", ck.sc.sessionID, op, key, value, reply)
 	}
 	DPrintf("%d: %s (%s) (%s) done\n", ck.sc.sessionID, op, key, value)
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	DPrintf("%d: Put (%s) (%s)\n", ck.sc.sessionID, key, value)
 	ck.PutAppend(key, value, "Put")
 }
 func (ck *Clerk) Append(key string, value string) {
-	DPrintf("%d: Append (%s) (%s)\n", ck.sc.sessionID, key, value)
 	ck.PutAppend(key, value, "Append")
 }
 
 type PutCommandRes struct {
 	from  int64
-	reply Reply
+	reply RPCSessionReply
 }
 
 type RPCReply struct {
 	ok    bool
-	reply Reply
+	reply RPCSessionReply
 }
 
 func GetRPC(c interface{}, i int64, args *RPCSessionArgs) RPCReply {
 	ck := c.(*Clerk)
-	var reply GetReply
+	var reply RPCSessionReply
 	DPrintf("%d: Calling %d KVServer.Get\n", ck.sc.sessionID, i)
 	ok := ck.servers[i].Call("KVServer.Get", args, &reply)
 	return RPCReply{
@@ -136,7 +150,7 @@ func GetRPC(c interface{}, i int64, args *RPCSessionArgs) RPCReply {
 
 func PutAppendRPC(c interface{}, i int64, args *RPCSessionArgs) RPCReply {
 	ck := c.(*Clerk)
-	var reply PutAppendReply
+	var reply RPCSessionReply
 	DPrintf("%d: Calling %d KVServer.PutAppend\n", ck.sc.sessionID, i)
 	ok := ck.servers[i].Call("KVServer.PutAppend", args, &reply)
 	return RPCReply{
@@ -152,7 +166,7 @@ func CallRPC(rpc func(interface{}, int64, *RPCSessionArgs) RPCReply, c interface
 		return
 	}
 	reply := rpcreply.reply
-	if reply.err() == ErrReplacedRequest {
+	if reply.Err == RPCErrReplacedRequest {
 		// The outer logic has already been trying another server
 		return
 	}
@@ -165,7 +179,7 @@ func CallRPC(rpc func(interface{}, int64, *RPCSessionArgs) RPCReply, c interface
 	}
 }
 
-func (sc *SessionClient) PutCommand(rpc func(interface{}, int64, *RPCSessionArgs) RPCReply, c interface{}, args interface{}) Reply {
+func (sc *SessionClient) PutCommand(rpc func(interface{}, int64, *RPCSessionArgs) RPCReply, c interface{}, args interface{}) RPCSessionReply {
 	seq := sc.NewSeq()
 	rpc_args := RPCSessionArgs{
 		SessionID: sc.sessionID,
@@ -181,9 +195,13 @@ func (sc *SessionClient) PutCommand(rpc func(interface{}, int64, *RPCSessionArgs
 		case <-time.After(time.Millisecond * 500):
 			DPrintf("Timeout\n")
 		case res := <-resChan:
-			if res.reply.err() == "ErrWrongLeader" {
+			if res.reply.Err == RPCErrWrongLeader {
 				break
 			}
+			if res.reply.Err == RPCErrObsoleteRequest {
+				log.Fatalf("Unexpected RPC error: RPCErrObsoleteRequest\n")
+			}
+			// res.reply.Err still might be RPCErrKilled and RPCOK
 			close(abort)
 			sc.knownLeader = res.from
 			return res.reply
