@@ -32,14 +32,20 @@ type replyChanWithSeq struct {
 
 type SessionServer struct {
 	mu         sync.Mutex
-	replyChans map[int64]replyChanWithSeq
-	replyBuf   map[int64]replyWithSeq
-	quit       chan struct{}
+	ReplyChans map[int64]replyChanWithSeq
+	ReplyBuf   map[int64]replyWithSeq
+	Quit       chan struct{}
+}
+
+func InitSessionServer(ss *SessionServer, quit chan struct{}) {
+	ss.ReplyChans = make(map[int64]replyChanWithSeq)
+	ss.ReplyBuf = make(map[int64]replyWithSeq)
+	ss.Quit = quit
 }
 
 func (ss *SessionServer) checkBuf(rpc_args *RPCSessionArgs, reply *RPCSessionReply, withRet bool) bool {
 	ss.mu.Lock()
-	buf, ok := ss.replyBuf[rpc_args.SessionID]
+	buf, ok := ss.ReplyBuf[rpc_args.SessionID]
 	ss.mu.Unlock()
 	if ok {
 		if buf.Seq == rpc_args.Seq {
@@ -63,10 +69,10 @@ func (ss *SessionServer) HandleRPC(rpc_args *RPCSessionArgs, do func(interface{}
 	}
 	replyChan := make(chan RPCSessionReply, 1)
 	ss.mu.Lock()
-	if original, ok := ss.replyChans[rpc_args.SessionID]; ok {
+	if original, ok := ss.ReplyChans[rpc_args.SessionID]; ok {
 		original.replyChan <- RPCSessionReply{Err: RPCErrReplacedRequest}
 	}
-	ss.replyChans[rpc_args.SessionID] = replyChanWithSeq{
+	ss.ReplyChans[rpc_args.SessionID] = replyChanWithSeq{
 		seq:       rpc_args.Seq,
 		replyChan: replyChan,
 	}
@@ -74,15 +80,15 @@ func (ss *SessionServer) HandleRPC(rpc_args *RPCSessionArgs, do func(interface{}
 	reply.Err = do(c, rpc_args, ss)
 	if reply.Err != RPCOK {
 		ss.mu.Lock()
-		replyChanWithSeq, ok := ss.replyChans[rpc_args.SessionID]
+		replyChanWithSeq, ok := ss.ReplyChans[rpc_args.SessionID]
 		if ok && replyChanWithSeq.seq == rpc_args.Seq {
-			delete(ss.replyChans, rpc_args.SessionID)
+			delete(ss.ReplyChans, rpc_args.SessionID)
 		}
 		ss.mu.Unlock()
 		return
 	}
 	select {
-	case <-ss.quit:
+	case <-ss.Quit:
 		reply.Err = RPCErrKilled
 	case reply = <-replyChan:
 	}
@@ -90,12 +96,11 @@ func (ss *SessionServer) HandleRPC(rpc_args *RPCSessionArgs, do func(interface{}
 	return
 }
 
-// exec will be called with ss.mu locked
 func (ss *SessionServer) HandleAppliedCommand(rpc_args *RPCSessionArgs, c interface{}, exec func(interface{}, interface{}) interface{}, withRet bool) {
 	ss.mu.Lock()
 	var replyChan chan RPCSessionReply
-	replyChanWithSeq, replyChanOk := ss.replyChans[rpc_args.SessionID]
-	sessionReply, ok := ss.replyBuf[rpc_args.SessionID]
+	replyChanWithSeq, replyChanOk := ss.ReplyChans[rpc_args.SessionID]
+	sessionReply, ok := ss.ReplyBuf[rpc_args.SessionID]
 	if replyChanOk && replyChanWithSeq.seq == rpc_args.Seq {
 		replyChan = replyChanWithSeq.replyChan
 		// Hold the lock to make sure that replyChan will not be closed by others
@@ -115,13 +120,13 @@ func (ss *SessionServer) HandleAppliedCommand(rpc_args *RPCSessionArgs, c interf
 				Reply: exec(c, rpc_args.Args),
 			}
 			// Fill the buffer immediately to avoid multiple execution of the same request
-			ss.replyBuf[rpc_args.SessionID] = replyWithSeq{
+			ss.ReplyBuf[rpc_args.SessionID] = replyWithSeq{
 				Seq:   rpc_args.Seq,
 				Reply: reply,
 			}
 		}
 		replyChan <- reply // non-blocking
-		delete(ss.replyChans, rpc_args.SessionID)
+		delete(ss.ReplyChans, rpc_args.SessionID)
 	} else {
 		if !ok || sessionReply.Seq < rpc_args.Seq {
 			reply := RPCSessionReply{
@@ -129,7 +134,7 @@ func (ss *SessionServer) HandleAppliedCommand(rpc_args *RPCSessionArgs, c interf
 				Reply: exec(c, rpc_args.Args),
 			}
 			// Fill the buffer immediately to avoid multiple execution of the same request
-			ss.replyBuf[rpc_args.SessionID] = replyWithSeq{
+			ss.ReplyBuf[rpc_args.SessionID] = replyWithSeq{
 				Seq:   rpc_args.Seq,
 				Reply: reply,
 			}
@@ -233,19 +238,19 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 
 	ss := &kv.ss
-	ss.replyChans = make(map[int64]replyChanWithSeq)
+	ss.ReplyChans = make(map[int64]replyChanWithSeq)
 
 	snapshot := persister.ReadSnapshot()
 	if snapshot == nil || len(snapshot) == 0 {
 		kv.kv = make(map[string]string)
-		ss.replyBuf = make(map[int64]replyWithSeq)
+		ss.ReplyBuf = make(map[int64]replyWithSeq)
 		kv.lastApplied = kv.rf.LogBaseIndex
 	} else {
 		kv.installSnapshot(kv.rf.LogBaseIndex, snapshot)
 	}
 
 	kv.quit = make(chan struct{})
-	ss.quit = kv.quit
+	ss.Quit = kv.quit
 
 	go kv.Run()
 
@@ -316,7 +321,7 @@ func (kv *KVServer) makeSnapshot() []byte {
 	err := e.Encode(kv.kv)
 	crashIf(err)
 	kv.ss.mu.Lock()
-	err = e.Encode(kv.ss.replyBuf)
+	err = e.Encode(kv.ss.ReplyBuf)
 	crashIf(err)
 	kv.ss.mu.Unlock()
 	return w.Bytes()
@@ -334,7 +339,7 @@ func (kv *KVServer) installSnapshot(index int, snapshot []byte) {
 	crashIf(err)
 
 	kv.ss.mu.Lock()
-	err = d.Decode(&kv.ss.replyBuf)
+	err = d.Decode(&kv.ss.ReplyBuf)
 	crashIf(err)
 	kv.ss.mu.Unlock()
 }
