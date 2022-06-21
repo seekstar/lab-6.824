@@ -4,98 +4,115 @@ package shardctrler
 // Shardctrler clerk.
 //
 
-import "6.824/labrpc"
-import "time"
-import "crypto/rand"
-import "math/big"
+import (
+	"log"
+
+	// Session Manager
+	sm "6.824/kvraft"
+	"6.824/labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
-}
-
-func nrand() int64 {
-	max := big.NewInt(int64(1) << 62)
-	bigx, _ := rand.Int(rand.Reader, max)
-	x := bigx.Int64()
-	return x
+	sc sm.SessionClient
 }
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// Your code here.
+	sm.InitSessionClient(&ck.sc, int64(len(servers)))
 	return ck
 }
 
 func (ck *Clerk) Query(num int) Config {
-	args := &QueryArgs{}
 	// Your code here.
-	args.Num = num
-	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply QueryReply
-			ok := srv.Call("ShardCtrler.Query", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return reply.Config
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
+	rpc_reply := ck.sc.PutCommand(queryRPC, ck, QueryArgs{num})
+	if rpc_reply.Err == sm.RPCErrKilled {
+		log.Fatalf("%d: Query (%d) returns RPCErrKilled\n", ck.sc.SessionID, num)
 	}
+	if rpc_reply.Err != sm.RPCOK {
+		log.Fatalf("%d: Query (%d) returns unexpected RPC error: %d\n", ck.sc.SessionID, num, rpc_reply.Err)
+	}
+	config := rpc_reply.Reply.(Config)
+	DPrintf("%d: Query (%d) returns (%v)\n", ck.sc.SessionID, num, config)
+	return config
 }
 
 func (ck *Clerk) Join(servers map[int][]string) {
-	args := &JoinArgs{}
 	// Your code here.
-	args.Servers = servers
-
-	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply JoinReply
-			ok := srv.Call("ShardCtrler.Join", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
+	servers_array := make([]GIDNames, 0, len(servers))
+	for gid, names := range servers {
+		servers_array = append(servers_array, GIDNames{gid, names})
+	}
+	rpc_reply := ck.sc.PutCommand(joinRPC, ck, JoinArgs{servers_array})
+	if rpc_reply.Err == sm.RPCErrKilled {
+		log.Fatalf("%d: Join (%v) returns RPCErrKilled\n", ck.sc.SessionID, servers)
+	}
+	if rpc_reply.Err != sm.RPCOK {
+		log.Fatalf("%d: Join (%v) returns unexpected RPC error: %d\n", ck.sc.SessionID, servers, rpc_reply.Err)
+	}
+	reply := rpc_reply.Reply
+	if reply != nil {
+		log.Fatalf("%d: Join (%v) reply non-nil value: %v\n", ck.sc.SessionID, servers, reply)
 	}
 }
 
 func (ck *Clerk) Leave(gids []int) {
-	args := &LeaveArgs{}
 	// Your code here.
-	args.GIDs = gids
-
-	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply LeaveReply
-			ok := srv.Call("ShardCtrler.Leave", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
+	rpc_reply := ck.sc.PutCommand(leaveRPC, ck, LeaveArgs{gids})
+	if rpc_reply.Err == sm.RPCErrKilled {
+		log.Fatalf("%d: Leave (%v) returns RPCErrKilled\n", ck.sc.SessionID, gids)
+	}
+	if rpc_reply.Err != sm.RPCOK {
+		log.Fatalf("%d: Leave (%v) returns unexpected RPC error: %d\n", ck.sc.SessionID, gids, rpc_reply.Err)
+	}
+	reply := rpc_reply.Reply
+	if reply != nil {
+		log.Fatalf("%d: Leave (%v) reply non-nil value: %v\n", ck.sc.SessionID, gids, reply)
 	}
 }
 
 func (ck *Clerk) Move(shard int, gid int) {
-	args := &MoveArgs{}
 	// Your code here.
-	args.Shard = shard
-	args.GID = gid
-
-	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply MoveReply
-			ok := srv.Call("ShardCtrler.Move", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
+	rpc_reply := ck.sc.PutCommand(moveRPC, ck, MoveArgs{shard, gid})
+	if rpc_reply.Err == sm.RPCErrKilled {
+		log.Fatalf("%d: Move (%d, %d) returns RPCErrKilled\n", ck.sc.SessionID, shard, gid)
 	}
+	if rpc_reply.Err != sm.RPCOK {
+		log.Fatalf("%d: Move (%d, %d) returns unexpected RPC error: %d\n", ck.sc.SessionID, shard, gid, rpc_reply.Err)
+	}
+	reply := rpc_reply.Reply
+	if reply != nil {
+		log.Fatalf("%d: Move (%d, %d) reply non-nil value: %v\n", ck.sc.SessionID, shard, gid, reply)
+	}
+}
+
+func queryRPC(c interface{}, i int64, args *sm.RPCSessionArgs) sm.RPCReply {
+	ck := c.(*Clerk)
+	var reply sm.RPCSessionReply
+	ok := ck.servers[i].Call("ShardCtrler.Query", args, &reply)
+	return sm.RPCReply{Ok: ok, Reply: reply}
+}
+
+func joinRPC(c interface{}, i int64, args *sm.RPCSessionArgs) sm.RPCReply {
+	ck := c.(*Clerk)
+	var reply sm.RPCSessionReply
+	ok := ck.servers[i].Call("ShardCtrler.Join", args, &reply)
+	return sm.RPCReply{Ok: ok, Reply: reply}
+}
+
+func leaveRPC(c interface{}, i int64, args *sm.RPCSessionArgs) sm.RPCReply {
+	ck := c.(*Clerk)
+	var reply sm.RPCSessionReply
+	ok := ck.servers[i].Call("ShardCtrler.Leave", args, &reply)
+	return sm.RPCReply{Ok: ok, Reply: reply}
+}
+
+func moveRPC(c interface{}, i int64, args *sm.RPCSessionArgs) sm.RPCReply {
+	ck := c.(*Clerk)
+	var reply sm.RPCSessionReply
+	ok := ck.servers[i].Call("ShardCtrler.Move", args, &reply)
+	return sm.RPCReply{Ok: ok, Reply: reply}
 }
