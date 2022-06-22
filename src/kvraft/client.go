@@ -70,7 +70,7 @@ func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
 	DPrintf("%d: Get (%s)\n", ck.sc.SessionID, key)
-	rpc_reply := ck.sc.PutCommand(GetRPC, ck, int64(len(ck.servers)), GetArgs{Key: key})
+	rpc_reply := ck.sc.PutCommand(ck.servers, "KVServer.Get", GetArgs{Key: key})
 	if rpc_reply.Err == RPCErrKilled {
 		log.Fatalf("%d: Get (%s) returns RPCErrKilled\n", ck.sc.SessionID, key)
 	}
@@ -103,9 +103,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	DPrintf("%d: %s (%s) (%s)\n", ck.sc.SessionID, op, key, value)
 	rpc_reply := ck.sc.PutCommand(
-		PutAppendRPC,
-		ck,
-		int64(len(ck.servers)),
+		ck.servers,
+		"KVServer.PutAppend",
 		PutAppendArgs{
 			Key:   key,
 			Value: value,
@@ -142,35 +141,13 @@ type RPCReply struct {
 	Reply RPCSessionReply
 }
 
-func GetRPC(c interface{}, i int64, args *RPCSessionArgs) RPCReply {
-	ck := c.(*Clerk)
+func CallRPC(clients []*labrpc.ClientEnd, i int64, svcMeth string, args *RPCSessionArgs, resChan chan PutCommandRes, abort chan struct{}) {
 	var reply RPCSessionReply
-	DPrintf("%d: Calling %d KVServer.Get\n", ck.sc.SessionID, i)
-	ok := ck.servers[i].Call("KVServer.Get", args, &reply)
-	return RPCReply{
-		ok,
-		reply,
-	}
-}
-
-func PutAppendRPC(c interface{}, i int64, args *RPCSessionArgs) RPCReply {
-	ck := c.(*Clerk)
-	var reply RPCSessionReply
-	DPrintf("%d: Calling %d KVServer.PutAppend\n", ck.sc.SessionID, i)
-	ok := ck.servers[i].Call("KVServer.PutAppend", args, &reply)
-	return RPCReply{
-		ok,
-		reply,
-	}
-}
-
-func CallRPC(rpc func(interface{}, int64, *RPCSessionArgs) RPCReply, c interface{}, i int64, args *RPCSessionArgs, resChan chan PutCommandRes, abort chan struct{}) {
-	rpcreply := rpc(c, i, args)
-	if !rpcreply.Ok {
+	ok := clients[i].Call(svcMeth, args, &reply)
+	if !ok {
 		// Assume that the outer logic has already been trying another server
 		return
 	}
-	reply := rpcreply.Reply
 	if reply.Err == RPCErrReplacedRequest {
 		// The outer logic has already been trying another server
 		return
@@ -184,7 +161,7 @@ func CallRPC(rpc func(interface{}, int64, *RPCSessionArgs) RPCReply, c interface
 	}
 }
 
-func (sc *SessionClient) PutCommand(rpc func(interface{}, int64, *RPCSessionArgs) RPCReply, c interface{}, serverNum int64, args interface{}) RPCSessionReply {
+func (sc *SessionClient) PutCommand(clients []*labrpc.ClientEnd, svcMeth string, args interface{}) RPCSessionReply {
 	seq := sc.NewSeq()
 	rpc_args := RPCSessionArgs{
 		SessionID: sc.SessionID,
@@ -195,7 +172,7 @@ func (sc *SessionClient) PutCommand(rpc func(interface{}, int64, *RPCSessionArgs
 	abort := make(chan struct{})
 	i := sc.knownLeader
 	for {
-		go CallRPC(rpc, c, i, &rpc_args, resChan, abort)
+		go CallRPC(clients, i, svcMeth, &rpc_args, resChan, abort)
 		select {
 		case <-time.After(time.Millisecond * 500):
 			DPrintf("Timeout\n")
@@ -211,6 +188,6 @@ func (sc *SessionClient) PutCommand(rpc func(interface{}, int64, *RPCSessionArgs
 			sc.knownLeader = res.from
 			return res.reply
 		}
-		i = (i + 1) % serverNum
+		i = (i + 1) % int64(len(clients))
 	}
 }

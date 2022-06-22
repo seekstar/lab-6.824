@@ -22,13 +22,13 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// Your code here.
-	sm.InitSessionClient(&ck.sc, int64(len(servers)))
+	sm.InitSessionClient(&ck.sc)
 	return ck
 }
 
 func (ck *Clerk) Query(num int) Config {
 	// Your code here.
-	rpc_reply := ck.sc.PutCommand(queryRPC, ck, QueryArgs{num})
+	rpc_reply := ck.sc.PutCommand(ck.servers, "ShardCtrler.Query", QueryArgs{num})
 	if rpc_reply.Err == sm.RPCErrKilled {
 		log.Fatalf("%d: Query (%d) returns RPCErrKilled\n", ck.sc.SessionID, num)
 	}
@@ -46,7 +46,7 @@ func (ck *Clerk) Join(servers map[int][]string) {
 	for gid, names := range servers {
 		servers_array = append(servers_array, GIDNames{gid, names})
 	}
-	rpc_reply := ck.sc.PutCommand(joinRPC, ck, JoinArgs{servers_array})
+	rpc_reply := ck.sc.PutCommand(ck.servers, "ShardCtrler.Join", JoinArgs{servers_array})
 	if rpc_reply.Err == sm.RPCErrKilled {
 		log.Fatalf("%d: Join (%v) returns RPCErrKilled\n", ck.sc.SessionID, servers)
 	}
@@ -61,7 +61,7 @@ func (ck *Clerk) Join(servers map[int][]string) {
 
 func (ck *Clerk) Leave(gids []int) {
 	// Your code here.
-	rpc_reply := ck.sc.PutCommand(leaveRPC, ck, LeaveArgs{gids})
+	rpc_reply := ck.sc.PutCommand(ck.servers, "ShardCtrler.Leave", LeaveArgs{gids})
 	if rpc_reply.Err == sm.RPCErrKilled {
 		log.Fatalf("%d: Leave (%v) returns RPCErrKilled\n", ck.sc.SessionID, gids)
 	}
@@ -76,7 +76,7 @@ func (ck *Clerk) Leave(gids []int) {
 
 func (ck *Clerk) Move(shard int, gid int) {
 	// Your code here.
-	rpc_reply := ck.sc.PutCommand(moveRPC, ck, MoveArgs{shard, gid})
+	rpc_reply := ck.sc.PutCommand(ck.servers, "ShardCtrler.Move", MoveArgs{shard, gid})
 	if rpc_reply.Err == sm.RPCErrKilled {
 		log.Fatalf("%d: Move (%d, %d) returns RPCErrKilled\n", ck.sc.SessionID, shard, gid)
 	}
@@ -87,32 +87,4 @@ func (ck *Clerk) Move(shard int, gid int) {
 	if reply != nil {
 		log.Fatalf("%d: Move (%d, %d) reply non-nil value: %v\n", ck.sc.SessionID, shard, gid, reply)
 	}
-}
-
-func queryRPC(c interface{}, i int64, args *sm.RPCSessionArgs) sm.RPCReply {
-	ck := c.(*Clerk)
-	var reply sm.RPCSessionReply
-	ok := ck.servers[i].Call("ShardCtrler.Query", args, &reply)
-	return sm.RPCReply{Ok: ok, Reply: reply}
-}
-
-func joinRPC(c interface{}, i int64, args *sm.RPCSessionArgs) sm.RPCReply {
-	ck := c.(*Clerk)
-	var reply sm.RPCSessionReply
-	ok := ck.servers[i].Call("ShardCtrler.Join", args, &reply)
-	return sm.RPCReply{Ok: ok, Reply: reply}
-}
-
-func leaveRPC(c interface{}, i int64, args *sm.RPCSessionArgs) sm.RPCReply {
-	ck := c.(*Clerk)
-	var reply sm.RPCSessionReply
-	ok := ck.servers[i].Call("ShardCtrler.Leave", args, &reply)
-	return sm.RPCReply{Ok: ok, Reply: reply}
-}
-
-func moveRPC(c interface{}, i int64, args *sm.RPCSessionArgs) sm.RPCReply {
-	ck := c.(*Clerk)
-	var reply sm.RPCSessionReply
-	ok := ck.servers[i].Call("ShardCtrler.Move", args, &reply)
-	return sm.RPCReply{Ok: ok, Reply: reply}
 }
