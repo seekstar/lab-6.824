@@ -74,6 +74,7 @@ func (sc *ShardCtrler) Query(rpc_args *sm.RPCSessionArgs, reply *sm.RPCSessionRe
 func (sc *ShardCtrler) Kill() {
 	sc.rf.Kill()
 	// Your code here, if desired.
+	close(sc.quit)
 }
 
 // needed by shardkv tester
