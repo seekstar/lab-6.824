@@ -19,14 +19,12 @@ type SessionClient struct {
 	SessionID   int64
 	seqTop      int64
 	knownLeader int64
-	serverNum   int64
 }
 
-func InitSessionClient(sc *SessionClient, serverNum int64) {
+func InitSessionClient(sc *SessionClient) {
 	sc.SessionID = nrand()
 	sc.seqTop = 0
 	sc.knownLeader = 0
-	sc.serverNum = serverNum
 	DPrintf("New session: %d\n", sc.SessionID)
 }
 
@@ -52,7 +50,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
-	InitSessionClient(&ck.sc, int64(len(ck.servers)))
+	InitSessionClient(&ck.sc)
 	return ck
 }
 
@@ -72,7 +70,7 @@ func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
 	DPrintf("%d: Get (%s)\n", ck.sc.SessionID, key)
-	rpc_reply := ck.sc.PutCommand(GetRPC, ck, GetArgs{Key: key})
+	rpc_reply := ck.sc.PutCommand(GetRPC, ck, int64(len(ck.servers)), GetArgs{Key: key})
 	if rpc_reply.Err == RPCErrKilled {
 		log.Fatalf("%d: Get (%s) returns RPCErrKilled\n", ck.sc.SessionID, key)
 	}
@@ -107,6 +105,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	rpc_reply := ck.sc.PutCommand(
 		PutAppendRPC,
 		ck,
+		int64(len(ck.servers)),
 		PutAppendArgs{
 			Key:   key,
 			Value: value,
@@ -185,7 +184,7 @@ func CallRPC(rpc func(interface{}, int64, *RPCSessionArgs) RPCReply, c interface
 	}
 }
 
-func (sc *SessionClient) PutCommand(rpc func(interface{}, int64, *RPCSessionArgs) RPCReply, c interface{}, args interface{}) RPCSessionReply {
+func (sc *SessionClient) PutCommand(rpc func(interface{}, int64, *RPCSessionArgs) RPCReply, c interface{}, serverNum int64, args interface{}) RPCSessionReply {
 	seq := sc.NewSeq()
 	rpc_args := RPCSessionArgs{
 		SessionID: sc.SessionID,
@@ -212,6 +211,6 @@ func (sc *SessionClient) PutCommand(rpc func(interface{}, int64, *RPCSessionArgs
 			sc.knownLeader = res.from
 			return res.reply
 		}
-		i = (i + 1) % sc.serverNum
+		i = (i + 1) % serverNum
 	}
 }
