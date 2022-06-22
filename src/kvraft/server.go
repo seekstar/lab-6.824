@@ -43,6 +43,20 @@ func InitSessionServer(ss *SessionServer, quit chan struct{}) {
 	ss.Quit = quit
 }
 
+func (ss *SessionServer) EncodeTo(e *labgob.LabEncoder) {
+	ss.mu.Lock()
+	err := e.Encode(ss.ReplyBuf)
+	crashIf(err)
+	ss.mu.Unlock()
+}
+
+func (ss *SessionServer) DecodeFrom(d *labgob.LabDecoder) {
+	ss.mu.Lock()
+	err := d.Decode(&ss.ReplyBuf)
+	crashIf(err)
+	ss.mu.Unlock()
+}
+
 func (ss *SessionServer) checkBuf(rpc_args *RPCSessionArgs, reply *RPCSessionReply, withRet bool) bool {
 	ss.mu.Lock()
 	buf, ok := ss.ReplyBuf[rpc_args.SessionID]
@@ -151,12 +165,10 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	ss SessionServer
-
+	ss          SessionServer
 	kv          map[string]string
 	lastApplied int
-
-	quit chan struct{}
+	quit        chan struct{}
 }
 
 func raft_start(c interface{}, rpc_args *RPCSessionArgs, ss *SessionServer) int {
@@ -236,20 +248,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
-	ss := &kv.ss
-	ss.ReplyChans = make(map[int64]replyChanWithSeq)
+	kv.quit = make(chan struct{})
+	InitSessionServer(&kv.ss, kv.quit)
 
 	snapshot := persister.ReadSnapshot()
 	if snapshot == nil || len(snapshot) == 0 {
 		kv.kv = make(map[string]string)
-		ss.ReplyBuf = make(map[int64]replyWithSeq)
 		kv.lastApplied = kv.rf.LogBaseIndex
 	} else {
 		kv.installSnapshot(kv.rf.LogBaseIndex, snapshot)
 	}
-
-	kv.quit = make(chan struct{})
-	ss.Quit = kv.quit
 
 	go kv.Run()
 
@@ -315,10 +323,7 @@ func (kv *KVServer) makeSnapshot() []byte {
 	e := labgob.NewEncoder(w)
 	err := e.Encode(kv.kv)
 	crashIf(err)
-	kv.ss.mu.Lock()
-	err = e.Encode(kv.ss.ReplyBuf)
-	crashIf(err)
-	kv.ss.mu.Unlock()
+	kv.ss.EncodeTo(e)
 	return w.Bytes()
 }
 
@@ -332,11 +337,7 @@ func (kv *KVServer) installSnapshot(index int, snapshot []byte) {
 	d := labgob.NewDecoder(r)
 	err := d.Decode(&kv.kv)
 	crashIf(err)
-
-	kv.ss.mu.Lock()
-	err = d.Decode(&kv.ss.ReplyBuf)
-	crashIf(err)
-	kv.ss.mu.Unlock()
+	kv.ss.DecodeFrom(d)
 }
 
 func (kv *KVServer) Run() {
