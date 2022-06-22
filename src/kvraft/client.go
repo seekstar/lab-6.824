@@ -10,6 +10,12 @@ import (
 )
 
 type SessionClient struct {
+	// TODO: Lease for each session.
+	// The server should reject the new sessions whose sequence number is not 1.
+	// But in this way the clerk can not be sure whether the last operation is
+	// successful or not.
+	// Maybe the transactions are necessary to handle this case.
+	// The transactions are also needed to handle the crash of clerk.
 	SessionID   int64
 	seqTop      int64
 	knownLeader int64
