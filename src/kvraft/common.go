@@ -40,10 +40,6 @@ type PutAppendArgs struct {
 	// otherwise RPC will break.
 }
 
-type PutAppendReply struct {
-	Err Err
-}
-
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.

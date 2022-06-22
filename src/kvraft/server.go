@@ -224,7 +224,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	labgob.Register(map[string]string{})
 	labgob.Register(map[int64]RPCSessionReply{})
 	labgob.Register(GetReply{})
-	labgob.Register(PutAppendReply{})
 
 	kv := new(KVServer)
 	kv.me = me
@@ -297,12 +296,8 @@ func (kv *KVServer) handleAppliedCommand(msg *raft.ApplyMsg) {
 	rpc_args := msg.Command.(RPCSessionArgs)
 	t := reflect.TypeOf(rpc_args.Args)
 	if t == reflect.TypeOf(GetArgs{}) {
-		args := rpc_args.Args.(GetArgs)
-		DPrintf("%d: Get (%s), %d %d, applied\n", kv.me, args.Key, rpc_args.SessionID, rpc_args.Seq)
 		ss.HandleAppliedCommand(&rpc_args, kv, execGet, true)
 	} else if t == reflect.TypeOf(PutAppendArgs{}) {
-		args := rpc_args.Args.(PutAppendArgs)
-		DPrintf("%d: %s (%s) (%s), %d %d, applied\n", kv.me, args.Op, args.Key, args.Value, rpc_args.SessionID, rpc_args.Seq)
 		ss.HandleAppliedCommand(&rpc_args, kv, execPutAppend, false)
 	} else {
 		log.Fatalf("Unknown type of command: %s\n", t.Name())
