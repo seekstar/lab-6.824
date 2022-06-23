@@ -115,7 +115,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	return sc
 }
 
-func deep_copy(m map[int][]string) map[int][]string {
+// Generics require go 1.18
+func copy_map(m map[int][]string) map[int][]string {
 	ret := make(map[int][]string)
 	for k, v := range m {
 		ret[k] = v
@@ -130,7 +131,7 @@ func exeJoin(c interface{}, a interface{}) interface{} {
 	sc.configs = append(sc.configs, Config{
 		Num:    old_config.Num + 1,
 		Shards: old_config.Shards,
-		Groups: deep_copy(old_config.Groups),
+		Groups: copy_map(old_config.Groups),
 	})
 	new_config := &sc.configs[len(sc.configs)-1]
 
@@ -250,7 +251,7 @@ func exeLeave(c interface{}, a interface{}) interface{} {
 	sc.configs = append(sc.configs, Config{
 		Num:    old_config.Num + 1,
 		Shards: old_config.Shards,
-		Groups: deep_copy(old_config.Groups),
+		Groups: copy_map(old_config.Groups),
 	})
 	new_config := &sc.configs[len(sc.configs)-1]
 
@@ -323,7 +324,7 @@ func exeMove(c interface{}, a interface{}) interface{} {
 	sc.configs = append(sc.configs, Config{
 		Num:    old_config.Num + 1,
 		Shards: old_config.Shards,
-		Groups: deep_copy(old_config.Groups),
+		Groups: copy_map(old_config.Groups),
 	})
 	new_config := &sc.configs[len(sc.configs)-1]
 	new_config.Shards[args.Shard] = args.GID
