@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"sort"
 	"sync"
 	"time"
 
@@ -48,13 +49,10 @@ type ShardKV struct {
 	num_shards_to_receive int
 
 	mu sync.Mutex
-	// The key is the first shard
-	shards_transmitting map[int]TransmittingShardsInfo
-	// Increase when installing snapshot. When transmitting finishes, it checks
-	// the snapshot sequence, if it does not equal to the original value, then
-	// there has been snapshot installed, so it won't delete the corresponding
-	// element in shards_transmitting.
-	snapshot_seq int64
+	// The key is session ID
+	shards_transmitting map[int64]*TransmittingShardsInfo
+
+	session_id_top int64
 
 	config_polled chan shardctrler.Config
 	quit          chan struct{}
@@ -167,6 +165,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	snapshot := persister.ReadSnapshot()
 	if snapshot == nil || len(snapshot) == 0 {
 		kv.lastApplied = kv.rf.LogBaseIndex
+		kv.shards_transmitting = make(map[int64]*TransmittingShardsInfo)
+		// TODO: A session id allocator
+		kv.session_id_top = int64(kv.gid) * 100000000
 	} else {
 		kv.installSnapshot(kv.rf.LogBaseIndex, snapshot)
 	}
@@ -177,8 +178,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 // Used internally
 type TransmittingShardsInfo struct {
-	Args  *ReceiveShardArgs
-	Names []string
+	SessionID int64
+	Names     []string
+	Args      *ReceiveShardArgs
 }
 
 func names2clients(names []string, make_end func(string) *labrpc.ClientEnd) []*labrpc.ClientEnd {
@@ -296,11 +298,14 @@ func execPutAppend(c interface{}, a interface{}) interface{} {
 	return OK
 }
 
-func (kv *ShardKV) transmitShards(args *ReceiveShardArgs, names []string, snapshot_seq int64) {
+func (kv *ShardKV) transmitShards(info *TransmittingShardsInfo) {
 	var sc sm.SessionClient
-	sm.InitSessionClient(&sc)
+	sm.InitSessionClientWithSessionID(&sc, info.SessionID)
+	names := info.Names
+	args := info.Args
 
-	DPrintf("(%d,%d): Transmitting to %v: %v\n", kv.gid, kv.me, names, args)
+	DPrintf("(%d,%d): Session %d: Transmitting to %v: %v\n",
+		kv.gid, kv.me, info.SessionID, names, args)
 	target_group_peers := names2clients(names, kv.make_end)
 	rpc_reply := sc.PutCommand(target_group_peers, "ShardKV.ReceiveShards", args)
 	if rpc_reply.Err == sm.RPCErrKilled {
@@ -315,16 +320,14 @@ func (kv *ShardKV) transmitShards(args *ReceiveShardArgs, names []string, snapsh
 				sc.SessionID, args, names, reply)
 		}
 	}
-	first_shard_id := args.Shards[0].ID
 	kv.mu.Lock()
-	// if kv.shards_transmitting[first_shard_id].Args.ConfigNum == args.ConfigNum {
-	if kv.snapshot_seq == snapshot_seq {
-		delete(kv.shards_transmitting, first_shard_id)
-	} else {
-		// There has been snapshot installed, and shards_transmitting has been
-		// overwritten
-	}
+	delete(kv.shards_transmitting, info.SessionID)
 	kv.mu.Unlock()
+}
+
+func (kv *ShardKV) newSessionID() int64 {
+	kv.session_id_top += 1
+	return kv.session_id_top
 }
 
 func (kv *ShardKV) checkNumShardsToReceive() {
@@ -358,6 +361,25 @@ func (kv *ShardKV) findShardsToReceive() {
 	kv.checkNumShardsToReceive()
 }
 
+type GIDShards struct {
+	gid    int
+	shards []int
+}
+
+type GIDShardsSorter []GIDShards
+
+func (a GIDShardsSorter) Len() int {
+	return len(a)
+}
+
+func (a GIDShardsSorter) Swap(i int, j int) {
+	a[i], a[j] = a[j], a[i]
+}
+
+func (a GIDShardsSorter) Less(i int, j int) bool {
+	return a[i].gid < a[j].gid
+}
+
 func (kv *ShardKV) switchConfig(new_config *shardctrler.Config) {
 	if new_config.Num <= kv.config.Num {
 		log.Panicf("new_config.Num = %d, kv.config.Num = %d\n",
@@ -376,8 +398,20 @@ func (kv *ShardKV) switchConfig(new_config *shardctrler.Config) {
 				append(shards_to_migrate[new_gid], shard)
 		}
 	}
-
+	shards_to_migrate_array := make(GIDShardsSorter, 0, len(shards_to_migrate))
 	for gid, shard_ids := range shards_to_migrate {
+		shards_to_migrate_array = append(shards_to_migrate_array, GIDShards{
+			gid:    gid,
+			shards: shard_ids,
+		})
+	}
+	sort.Sort(shards_to_migrate_array)
+	// The set of shard IDs is deterministic.
+
+	for _, gid_shards := range shards_to_migrate_array {
+		gid := gid_shards.gid
+		shard_ids := gid_shards.shards
+		// The set of shard_ids is deterministic.
 		shards := make([]Shard, 0, len(shard_ids))
 		for _, id := range shard_ids {
 			shard_kv := kv.shards[id]
@@ -389,14 +423,14 @@ func (kv *ShardKV) switchConfig(new_config *shardctrler.Config) {
 			Shards:    shards,
 		}
 		names := new_config.Groups[gid]
+		// Each session ID assigned to each TransmittingShardsInfo is
+		// deterministic.
+		session_id := kv.newSessionID()
+		info := &TransmittingShardsInfo{session_id, names, args}
 		kv.mu.Lock()
-		// It is okay to overwrite the old transmitting record with the same
-		// first shard, because the transmission has definitely been succeed,
-		// otherwise we will not own the shard now.
-		kv.shards_transmitting[args.Shards[0].ID] =
-			TransmittingShardsInfo{args, names}
+		kv.shards_transmitting[session_id] = info
 		kv.mu.Unlock()
-		go kv.transmitShards(args, names, kv.snapshot_seq)
+		go kv.transmitShards(info)
 	}
 
 	kv.findShardsToReceive()
@@ -413,14 +447,6 @@ func copy_map(m map[string]string) map[string]string {
 
 func copy_groups(m map[int][]string) map[int][]string {
 	ret := make(map[int][]string)
-	for k, v := range m {
-		ret[k] = v
-	}
-	return ret
-}
-
-func copy_transmitting(m map[int]TransmittingShardsInfo) map[int]TransmittingShardsInfo {
-	ret := make(map[int]TransmittingShardsInfo)
 	for k, v := range m {
 		ret[k] = v
 	}
@@ -580,6 +606,9 @@ func (kv *ShardKV) makeSnapshot() []byte {
 	kv.mu.Unlock()
 	crashIf(err)
 
+	err = e.Encode(kv.session_id_top)
+	crashIf(err)
+
 	// DPrintf("(%d,%d): Snapshot made: %s\n", kv.gid, kv.me, kv.sprintState())
 
 	return w.Bytes()
@@ -589,7 +618,6 @@ func (kv *ShardKV) initSomeState() {
 	kv.config_pending = make([]*shardctrler.Config, 0)
 	kv.config = &shardctrler.Config{}
 	kv.shards = make(map[int]map[string]string)
-	kv.shards_transmitting = make(map[int]TransmittingShardsInfo)
 }
 
 func (kv *ShardKV) installSnapshot(index int, snapshot []byte) {
@@ -597,9 +625,6 @@ func (kv *ShardKV) installSnapshot(index int, snapshot []byte) {
 		// The snapshot is not newer. Just ignore it.
 		return
 	}
-	kv.mu.Lock()
-	kv.snapshot_seq += 1
-	kv.mu.Unlock()
 	// Now the previous transmitting go routines won't touch shards_transmitting
 	// anymore
 	kv.initSomeState()
@@ -629,13 +654,21 @@ func (kv *ShardKV) installSnapshot(index int, snapshot []byte) {
 		len -= 1
 	}
 
+	kv.mu.Lock()
+	kv.shards_transmitting = make(map[int64]*TransmittingShardsInfo)
 	err = d.Decode(&kv.shards_transmitting)
 	crashIf(err)
-	// To avoid data race
-	shards_transmitting := copy_transmitting(kv.shards_transmitting)
-	for _, info := range shards_transmitting {
-		go kv.transmitShards(info.Args, info.Names, kv.snapshot_seq)
+	for _, info := range kv.shards_transmitting {
+		// Non-blocking
+		go kv.transmitShards(info)
 	}
+	kv.mu.Unlock()
+
+	var session_id_top int64
+	err = d.Decode(&session_id_top)
+	crashIf(err)
+	kv.session_id_top = session_id_top
+
 	kv.findShardsToReceive()
 	// DPrintf("(%d,%d): Snapshot installed: %s\n", kv.gid, kv.me, kv.sprintState())
 }
