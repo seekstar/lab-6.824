@@ -610,6 +610,7 @@ func (kv *ShardKV) makeSnapshot() []byte {
 	crashIf(err)
 
 	// DPrintf("(%d,%d): Snapshot made: %s\n", kv.gid, kv.me, kv.sprintState())
+	DPrintf("(%d,%d): Snapshot made\n", kv.gid, kv.me)
 
 	return w.Bytes()
 }
@@ -670,10 +671,13 @@ func (kv *ShardKV) installSnapshot(index int, snapshot []byte) {
 	kv.session_id_top = session_id_top
 
 	kv.findShardsToReceive()
-	// DPrintf("(%d,%d): Snapshot installed: %s\n", kv.gid, kv.me, kv.sprintState())
+	DPrintf("(%d,%d): Snapshot installed: %s\n", kv.gid, kv.me, kv.sprintState())
 }
 
 func (kv *ShardKV) Run() {
+	// To make sure that to make a new snapshot, at least one command has
+	// been applied.
+	last_applied_for_last_snapshot := 0
 	for {
 		select {
 		case <-kv.quit:
@@ -691,13 +695,20 @@ func (kv *ShardKV) Run() {
 					log.Fatalln("Applied message not command nor snapshot!")
 				}
 				kv.installSnapshot(msg.SnapshotIndex, msg.Snapshot)
+				last_applied_for_last_snapshot = kv.lastApplied
 			}
 		case persistedSize := <-kv.rf.PersistedSizeCh:
 			if kv.maxraftstate == -1 || persistedSize < kv.maxraftstate {
 				break
 			}
-			DPrintf("(%d,%d): persistedSize = %d, making snapshot\n", kv.gid, kv.me, persistedSize)
-			kv.rf.Snapshot(kv.lastApplied, kv.makeSnapshot())
+			DPrintf("(%d,%d): persistedSize = %d >= %d\n",
+				kv.gid, kv.me, persistedSize, kv.maxraftstate)
+			if last_applied_for_last_snapshot < kv.lastApplied {
+				kv.rf.Snapshot(kv.lastApplied, kv.makeSnapshot())
+				last_applied_for_last_snapshot = kv.lastApplied
+			} else {
+				DPrintf("(%d,%d): Snapshot delayed\n", kv.gid, kv.me)
+			}
 		}
 	}
 }
