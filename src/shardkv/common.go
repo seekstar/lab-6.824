@@ -10,10 +10,19 @@ package shardkv
 //
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
+	OK            = "OK"
+	ErrNoKey      = "ErrNoKey"
+	ErrWrongGroup = "ErrWrongGroup"
+	// Wait a while for it to be migrated to this server.
+	// TODO: When migrating a shard, there are several stages:
+	// Stage 1: The target group is receiving the group, and the source group
+	// still serves the shard, but keeps a operation log.
+	// Stage 2: The source group stops serving the shard, and transmits the
+	// operation log to the target group.
+	// Stage 3: The target group serves the shard.
+	// It is useless for this lab, because there is no server serving the shard
+	// in stage 2. But I think the stalling is necessary to avoid split brain.
+	ErrUnderMigration = "ErrUnderMigration"
 )
 
 type Err string
@@ -27,10 +36,6 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-}
-
-type PutAppendReply struct {
-	Err Err
 }
 
 type GetArgs struct {

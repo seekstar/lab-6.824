@@ -1,0 +1,61 @@
+// Stop the consensus prototype until the reconfiguration is done.
+// After the reconfiguration, all Raft peers are still in the same state.
+// It is expected that the same new configuration is also sent to other groups,
+// so other groups will also wait until the reconfiguration is done.
+
+type ReconfigureArgs struct {
+	ConfigNum       int
+	ShardsToMigrate []ShardGroupNames
+	ShardsToReceive []int
+}
+
+type ShardGroupNames struct {
+	Shard int
+	Names []string
+}
+
+	shards_to_receive := make(map[int]struct{})
+	for _, id := range args.ShardsToReceive {
+		if _, ok := kv.shards[id]; !ok {
+			shards_to_receive[id] = struct{}{}
+		}
+	}
+
+	for len(shards_to_receive) != 0 || num_shards_to_migrate != 0 {
+		select {
+		case <-kv.quit:
+			return nil
+		case received_shard := <-kv.received_shards:
+			kv.handleReceivedShard(received_shard)
+			if _, ok := shards_to_receive[received_shard.ID]; ok {
+				delete(shards_to_receive, received_shard.ID)
+			}
+		case id := <-done:
+			delete(kv.shards, id)
+			num_shards_to_migrate -= 1
+		}
+	}
+
+func (kv *ShardKV) handleReceivedShard(received_shard *ReceiveShardArgs) {
+	if _, ok := kv.shards[received_shard.ID]; !ok {
+		kv.shards[received_shard.ID] = received_shard.KV
+	}
+}
+
+	old_config := &sc.configs[len(sc.configs)-2]
+	new_config := &sc.configs[len(sc.configs)-1]
+	groups := make(map[int]struct{})
+	for gid := range old_config.Groups {
+		if _, ok := groups[gid]; !ok {
+			groups[gid] = struct{}{}
+		}
+	}
+	for gid := range new_config.Groups {
+		if _, ok := groups[gid]; !ok {
+			groups[gid] = struct{}{}
+		}
+	}
+	for gid := range groups {
+		sc.make_end()
+	}
+	go reconfigureShardServers()

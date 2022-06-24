@@ -8,11 +8,13 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
-import "6.824/shardctrler"
-import "time"
+import (
+	"log"
+
+	sm "6.824/kvraft"
+	"6.824/labrpc"
+	"6.824/shardctrler"
+)
 
 //
 // which shard is a key in?
@@ -28,18 +30,12 @@ func key2shard(key string) int {
 	return shard
 }
 
-func nrand() int64 {
-	max := big.NewInt(int64(1) << 62)
-	bigx, _ := rand.Int(rand.Reader, max)
-	x := bigx.Int64()
-	return x
-}
-
 type Clerk struct {
-	sm       *shardctrler.Clerk
-	config   shardctrler.Config
-	make_end func(string) *labrpc.ClientEnd
+	shardctrler *shardctrler.Clerk
+	config      shardctrler.Config
+	make_end    func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	sc sm.SessionClient
 }
 
 //
@@ -53,9 +49,10 @@ type Clerk struct {
 //
 func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
-	ck.sm = shardctrler.MakeClerk(ctrlers)
+	ck.shardctrler = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	sm.InitSessionClient(&ck.sc)
 	return ck
 }
 
@@ -66,33 +63,40 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
-
+	shard := key2shard(key)
+	DPrintf("%d: Get(%s,shard=%d)\n", ck.sc.SessionID, key, shard)
 	for {
-		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
-		if servers, ok := ck.config.Groups[gid]; ok {
-			// try each server for the shard.
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
-				var reply GetReply
-				ok := srv.Call("ShardKV.Get", &args, &reply)
-				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
-					return reply.Value
-				}
-				if ok && (reply.Err == ErrWrongGroup) {
-					break
-				}
-				// ... not ok, or ErrWrongLeader
+		if gid != 0 {
+			var names []string
+			var ok bool
+			names, ok = ck.config.Groups[gid]
+			if !ok {
+				log.Panicf("Inconsistent configuration: %v\n", ck.config)
 			}
+			clients := names2clients(names, ck.make_end)
+			rpc_reply := ck.sc.PutCommand(clients, "ShardKV.Get", GetArgs{key})
+			if rpc_reply.Err == sm.RPCOK {
+				reply := rpc_reply.Reply.(GetReply)
+				if reply.Err == OK || reply.Err == ErrNoKey {
+					return reply.Value
+				} else if reply.Err == ErrUnderMigration {
+					// TODO: Is it suitable to retry immediately here?
+					continue
+				} else if reply.Err != ErrWrongGroup {
+					log.Panicf("%d: Get(%s) returns unexpected error: %s\n",
+						ck.sc.SessionID, key, reply.Err)
+				}
+			} else if rpc_reply.Err != sm.RPCErrKilled {
+				log.Panicf("%d: Get(%s) returns unexpected RPC error: %d\n",
+					ck.sc.SessionID, key, rpc_reply.Err)
+			}
+			// Treat RPCErrKilled as ErrWrongGroup, because the current trying group
+			// might be a stale group and has been killed.
 		}
-		time.Sleep(100 * time.Millisecond)
 		// ask controler for the latest configuration.
-		ck.config = ck.sm.Query(-1)
+		ck.config = ck.shardctrler.Query(-1)
 	}
-
-	return ""
 }
 
 //
@@ -100,32 +104,43 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
-
-
+	shard := key2shard(key)
+	DPrintf("%d: (%s,%s,%s,shard=%d)\n", ck.sc.SessionID, op, key, value, shard)
 	for {
-		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
-		if servers, ok := ck.config.Groups[gid]; ok {
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
-				var reply PutAppendReply
-				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
-				if ok && reply.Err == OK {
-					return
-				}
-				if ok && reply.Err == ErrWrongGroup {
-					break
-				}
-				// ... not ok, or ErrWrongLeader
+		if gid != 0 {
+			var names []string
+			var ok bool
+			names, ok = ck.config.Groups[gid]
+			if !ok {
+				log.Panicf("Inconsistent configuration: %v\n", ck.config)
 			}
+			clients := names2clients(names, ck.make_end)
+			rpc_reply := ck.sc.PutCommand(
+				clients,
+				"ShardKV.PutAppend",
+				PutAppendArgs{Key: key, Value: value, Op: op},
+			)
+			if rpc_reply.Err == sm.RPCOK {
+				reply := rpc_reply.Reply.(string)
+				if reply == OK {
+					return
+				} else if reply == ErrUnderMigration {
+					// TODO: Is it suitable to retry immediately here?
+					continue
+				} else if reply != ErrWrongGroup {
+					log.Panicf("%d: (%s,%s,%s) returns unexpected error: %s\n",
+						ck.sc.SessionID, op, key, value, reply)
+				}
+			} else if rpc_reply.Err != sm.RPCErrKilled {
+				log.Panicf("%d: (%s,%s,%s) returns unexpected RPC error: %d\n",
+					ck.sc.SessionID, op, key, value, rpc_reply.Err)
+			}
+			// Treat RPCErrKilled as ErrWrongGroup, because the current trying group
+			// might be a stale group and has been killed.
 		}
-		time.Sleep(100 * time.Millisecond)
 		// ask controler for the latest configuration.
-		ck.config = ck.sm.Query(-1)
+		ck.config = ck.shardctrler.Query(-1)
 	}
 }
 
