@@ -32,7 +32,6 @@ type ShardKV struct {
 	applyCh      chan raft.ApplyMsg
 	make_end     func(string) *labrpc.ClientEnd
 	gid          int
-	ctrler_clerk *shardctrler.Clerk
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
@@ -71,7 +70,9 @@ func (kv *ShardKV) PutAppend(rpc_args *sm.RPCSessionArgs, reply *sm.RPCSessionRe
 // This was intended for the shard controller to push the new configurations to
 // the shard servers. But the shard controller does not have make_end.
 func (kv *ShardKV) Reconfigure(rpc_args *sm.RPCSessionArgs, reply *sm.RPCSessionReply) {
+	DPrintf("(%d,%d): Reconfigure RPC: %v\n", kv.gid, kv.me, *rpc_args)
 	*reply = kv.ss.HandleRPC(rpc_args, raftStart, kv, false)
+	DPrintf("(%d,%d): Reconfigure RPC %v returns: %v\n", kv.gid, kv.me, *rpc_args, *reply)
 }
 
 type Shard struct {
@@ -156,7 +157,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.ctrler_clerk = shardctrler.MakeClerk(ctrlers)
 
 	kv.quit = make(chan struct{})
 	sm.InitSessionServer(&kv.ss, kv.quit)
@@ -171,7 +171,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	} else {
 		kv.installSnapshot(kv.rf.LogBaseIndex, snapshot)
 	}
-	go kv.pollConfig(servers, kv.config.Num)
+	go kv.pollConfig(ctrlers, servers, kv.config.Num)
 	go kv.Run()
 	return kv
 }
@@ -191,13 +191,21 @@ func names2clients(names []string, make_end func(string) *labrpc.ClientEnd) []*l
 	return clients
 }
 
-func (kv *ShardKV) pollConfig(servers []*labrpc.ClientEnd, num int) {
+func (kv *ShardKV) pollConfig(ctrlers []*labrpc.ClientEnd, servers []*labrpc.ClientEnd, num int) {
+	ctrler_clerk := shardctrler.MakeClerkV2(ctrlers, kv.quit)
+	DPrintf("(%d,%d): pollConfig: Clerk for Shard Controller: SessionID = %d\n",
+		kv.gid, kv.me, ctrler_clerk.SessionClient.SessionID)
+
 	var sc sm.SessionClient
-	sm.InitSessionClient(&sc)
+	sm.InitSessionClient(&sc, kv.quit)
+	DPrintf("(%d,%d): pollConfig: Clerk for this ShardKV: sessionID = %d\n", kv.gid, kv.me, sc.SessionID)
 
 	t := time.NewTicker(100 * time.Millisecond)
 	for {
-		config := kv.ctrler_clerk.Query(num + 1)
+		config := ctrler_clerk.QueryV2(num + 1)
+		if config == nil {
+			return
+		}
 		if config.Num < num {
 			log.Panicf("Configuration number goes backward: %d -> %d\n",
 				num, config.Num)
@@ -206,13 +214,13 @@ func (kv *ShardKV) pollConfig(servers []*labrpc.ClientEnd, num int) {
 			continue
 		}
 		num = config.Num
-		// DPrintf("(%d,%d): New configuration: %v\n", kv.gid, kv.me, config)
+		DPrintf("(%d,%d): pollConfig: New configuration: %v\n", kv.gid, kv.me, config)
 		rpc_reply := sc.PutCommand(
 			servers,
 			"ShardKV.Reconfigure",
 			config,
 		)
-		if rpc_reply.Err == sm.RPCErrKilled {
+		if rpc_reply.Err == sm.RPCErrAbort || rpc_reply.Err == sm.RPCErrKilled {
 			return
 		}
 		if rpc_reply.Err != sm.RPCOK {
@@ -222,14 +230,14 @@ func (kv *ShardKV) pollConfig(servers []*labrpc.ClientEnd, num int) {
 		if reply != nil {
 			log.Fatalf("(%d,%d): Reconfigure (%v) reply non-nil value: %v\n", kv.gid, kv.me, config, reply)
 		}
-		// DPrintf("(%d,%d): Reconfigure (%v) done\n", kv.gid, kv.me, config)
+		DPrintf("(%d,%d): pollConfig: Reconfigure (%v) done\n", kv.gid, kv.me, config)
 		select {
 		case <-kv.quit:
 			t.Stop()
 			return
 		case <-t.C:
 		}
-		// DPrintf("(%d,%d): pollConfig continues\n", kv.gid, kv.me)
+		DPrintf("(%d,%d): pollConfig continues\n", kv.gid, kv.me)
 	}
 }
 
@@ -248,27 +256,31 @@ func execGet(c interface{}, a interface{}) interface{} {
 	args := a.(GetArgs)
 	shard := key2shard(args.Key)
 	shard_kv, ok := kv.shards[shard]
+	var reply GetReply
 	if !ok {
 		if kv.config.Shards[shard] != kv.gid {
-			return GetReply{
+			reply = GetReply{
 				Err: ErrWrongGroup,
 			}
 		} else {
-			return GetReply{
+			reply = GetReply{
 				Err: ErrUnderMigration,
 			}
 		}
-	}
-	if v, ok := shard_kv[args.Key]; ok {
-		return GetReply{
-			Err:   OK,
-			Value: v,
-		}
 	} else {
-		return GetReply{
-			Err: ErrNoKey,
+		if v, ok := shard_kv[args.Key]; ok {
+			reply = GetReply{
+				Err:   OK,
+				Value: v,
+			}
+		} else {
+			reply = GetReply{
+				Err: ErrNoKey,
+			}
 		}
 	}
+	DPrintf("(%d,%d): Get(%s) applied: %v\n", kv.gid, kv.me, args.Key, reply)
+	return reply
 }
 
 func execPutAppend(c interface{}, a interface{}) interface{} {
@@ -276,31 +288,36 @@ func execPutAppend(c interface{}, a interface{}) interface{} {
 	args := a.(PutAppendArgs)
 	shard := key2shard(args.Key)
 	shard_kv, ok := kv.shards[shard]
+	var reply string
 	if !ok {
 		if kv.config.Shards[shard] != kv.gid {
-			return ErrWrongGroup
+			reply = ErrWrongGroup
 		} else {
-			return ErrUnderMigration
+			reply = ErrUnderMigration
 		}
-	}
-	if args.Op == "Append" {
-		if v, ok := shard_kv[args.Key]; ok {
-			v += args.Value
-			shard_kv[args.Key] = v
-		} else {
-			shard_kv[args.Key] = args.Value
-		}
-	} else if args.Op == "Put" {
-		shard_kv[args.Key] = args.Value
 	} else {
-		log.Fatalf("Unknown operator: %s\n", args.Op)
+		if args.Op == "Append" {
+			if v, ok := shard_kv[args.Key]; ok {
+				v += args.Value
+				shard_kv[args.Key] = v
+			} else {
+				shard_kv[args.Key] = args.Value
+			}
+		} else if args.Op == "Put" {
+			shard_kv[args.Key] = args.Value
+		} else {
+			log.Fatalf("Unknown operator: %s\n", args.Op)
+		}
+		reply = OK
 	}
-	return OK
+	DPrintf("(%d,%d): %s(%s,%s) applied: %v\n",
+		kv.gid, kv.me, args.Op, args.Key, args.Value, reply)
+	return reply
 }
 
 func (kv *ShardKV) transmitShards(info *TransmittingShardsInfo) {
 	var sc sm.SessionClient
-	sm.InitSessionClientWithSessionID(&sc, info.SessionID)
+	sm.InitSessionClientWithSessionID(&sc, kv.quit, info.SessionID)
 	names := info.Names
 	args := info.Args
 
@@ -308,7 +325,9 @@ func (kv *ShardKV) transmitShards(info *TransmittingShardsInfo) {
 		kv.gid, kv.me, info.SessionID, names, args)
 	target_group_peers := names2clients(names, kv.make_end)
 	rpc_reply := sc.PutCommand(target_group_peers, "ShardKV.ReceiveShards", args)
-	if rpc_reply.Err == sm.RPCErrKilled {
+	if rpc_reply.Err == sm.RPCErrAbort {
+		return
+	} else if rpc_reply.Err == sm.RPCErrKilled {
 		fmt.Printf("Warning: %d: transmitShards(%v, %v) returns RPCErrKilled. Assuming transmitted successfully\n", sc.SessionID, args, names)
 	} else {
 		if rpc_reply.Err != sm.RPCOK {
@@ -343,6 +362,9 @@ func (kv *ShardKV) checkNumShardsToReceive() {
 			}
 			kv.switchConfig(config)
 		}
+	} else {
+		DPrintf("(%d,%d): Still %d shards to receive\n",
+			kv.gid, kv.me, kv.num_shards_to_receive)
 	}
 }
 
@@ -389,11 +411,15 @@ func (kv *ShardKV) switchConfig(new_config *shardctrler.Config) {
 		log.Panicf("The old configuration is still not done\n")
 	}
 	DPrintf("(%d,%d): Switching to configuration %v\n", kv.gid, kv.me, new_config)
+	old_config := kv.config
 	kv.config = new_config
 	shards_to_migrate := make(map[int][]int) // gid -> shards
 	for shard := range kv.shards {
 		new_gid := new_config.Shards[shard]
-		if new_gid != kv.gid {
+		// If we actually owns the shard in the original config, and the shard
+		// belongs to another shard in the new config, then the shard should
+		// be migrated.
+		if old_config.Shards[shard] == kv.gid && new_gid != kv.gid {
 			shards_to_migrate[new_gid] =
 				append(shards_to_migrate[new_gid], shard)
 		}
@@ -526,6 +552,9 @@ func execReceiveShards(c interface{}, a interface{}) interface{} {
 	}
 	DPrintf("(%d,%d): execReceiveShards done: %v\n", kv.gid, kv.me, args)
 	if cnt_to_serve != 0 {
+		if kv.num_shards_to_receive < cnt_to_serve {
+			log.Panicf("(%d,%d): Received %d shards, but only %d shards to receive\n", kv.gid, kv.me, cnt_to_serve, kv.num_shards_to_receive)
+		}
 		kv.num_shards_to_receive -= cnt_to_serve
 		kv.checkNumShardsToReceive()
 	}
@@ -578,7 +607,7 @@ func (kv *ShardKV) sprintConfigPending() string {
 
 func (kv *ShardKV) sprintState() string {
 	return fmt.Sprintf("config = %v, shards = %v, shards_transmitting = %s, "+
-		"config_num_done = %d, config = %v, config_pending = %v\n",
+		"config_num_done = %d, config = %v, config_pending = %v",
 		kv.config, kv.shards, kv.sprintShardTransmitting(), kv.config_num_done,
 		kv.config, kv.sprintConfigPending())
 }
@@ -609,8 +638,8 @@ func (kv *ShardKV) makeSnapshot() []byte {
 	err = e.Encode(kv.session_id_top)
 	crashIf(err)
 
-	// DPrintf("(%d,%d): Snapshot made: %s\n", kv.gid, kv.me, kv.sprintState())
-	DPrintf("(%d,%d): Snapshot made\n", kv.gid, kv.me)
+	DPrintf("(%d,%d): Snapshot made: %s\n", kv.gid, kv.me, kv.sprintState())
+	// DPrintf("(%d,%d): Snapshot made\n", kv.gid, kv.me)
 
 	return w.Bytes()
 }
@@ -701,13 +730,13 @@ func (kv *ShardKV) Run() {
 			if kv.maxraftstate == -1 || persistedSize < kv.maxraftstate {
 				break
 			}
-			DPrintf("(%d,%d): persistedSize = %d >= %d\n",
-				kv.gid, kv.me, persistedSize, kv.maxraftstate)
+			// DPrintf("(%d,%d): persistedSize = %d >= %d\n",
+			// 	kv.gid, kv.me, persistedSize, kv.maxraftstate)
 			if last_applied_for_last_snapshot < kv.lastApplied {
 				kv.rf.Snapshot(kv.lastApplied, kv.makeSnapshot())
 				last_applied_for_last_snapshot = kv.lastApplied
 			} else {
-				DPrintf("(%d,%d): Snapshot delayed\n", kv.gid, kv.me)
+				// DPrintf("(%d,%d): Snapshot delayed\n", kv.gid, kv.me)
 			}
 		}
 	}

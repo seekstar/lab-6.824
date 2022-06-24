@@ -10,6 +10,7 @@ package shardkv
 
 import (
 	"log"
+	"time"
 
 	sm "6.824/kvraft"
 	"6.824/labrpc"
@@ -32,7 +33,7 @@ func key2shard(key string) int {
 
 type Clerk struct {
 	shardctrler *shardctrler.Clerk
-	config      shardctrler.Config
+	config      *shardctrler.Config
 	make_end    func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
 	sc sm.SessionClient
@@ -50,9 +51,12 @@ type Clerk struct {
 func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.shardctrler = shardctrler.MakeClerk(ctrlers)
+	DPrintf("Clerk for ShardKV: SessionID for Shard controller: %d\n", ck.shardctrler.SessionClient.SessionID)
+	ck.config = &shardctrler.Config{}
 	ck.make_end = make_end
 	// You'll have to add code here.
-	sm.InitSessionClient(&ck.sc)
+	sm.InitSessionClient(&ck.sc, nil)
+	DPrintf("Clerk for ShardKV: SessionID for ShardKV server: %d\n", ck.sc.SessionID)
 	return ck
 }
 
@@ -81,7 +85,8 @@ func (ck *Clerk) Get(key string) string {
 				if reply.Err == OK || reply.Err == ErrNoKey {
 					return reply.Value
 				} else if reply.Err == ErrUnderMigration {
-					// TODO: Is it suitable to retry immediately here?
+					// TODO: Is 100ms suitable here?
+					time.Sleep(100 * time.Millisecond)
 					continue
 				} else if reply.Err != ErrWrongGroup {
 					log.Panicf("%d: Get(%s) returns unexpected error: %s\n",
@@ -95,7 +100,14 @@ func (ck *Clerk) Get(key string) string {
 			// might be a stale group and has been killed.
 		}
 		// ask controler for the latest configuration.
-		ck.config = ck.shardctrler.Query(-1)
+		config := ck.shardctrler.Query(-1)
+		if config.Num == ck.config.Num {
+			// Wait a while for the server to catch up
+			// TODO: Is 100ms suitable here?
+			time.Sleep(100 * time.Millisecond)
+		} else {
+			ck.config = &config
+		}
 	}
 }
 
@@ -126,7 +138,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				if reply == OK {
 					return
 				} else if reply == ErrUnderMigration {
-					// TODO: Is it suitable to retry immediately here?
+					// TODO: Is 100ms suitable here?
+					time.Sleep(100 * time.Millisecond)
 					continue
 				} else if reply != ErrWrongGroup {
 					log.Panicf("%d: (%s,%s,%s) returns unexpected error: %s\n",
@@ -140,7 +153,14 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			// might be a stale group and has been killed.
 		}
 		// ask controler for the latest configuration.
-		ck.config = ck.shardctrler.Query(-1)
+		config := ck.shardctrler.Query(-1)
+		if config.Num == ck.config.Num {
+			// Wait a while for the server to catch up
+			// TODO: Is 100ms suitable here?
+			time.Sleep(100 * time.Millisecond)
+		} else {
+			ck.config = &config
+		}
 	}
 }
 
