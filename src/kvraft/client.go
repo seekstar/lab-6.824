@@ -21,24 +21,28 @@ type SessionClient struct {
 	knownLeader int64
 }
 
-func InitSessionClient(sc *SessionClient) {
-	sc.SessionID = nrand()
+func NewSessionID() int64 {
+	max := big.NewInt(int64(1) << 62)
+	bigx, _ := rand.Int(rand.Reader, max)
+	x := bigx.Int64()
+	DPrintf("New session: %d\n", x)
+	return x
+}
+
+func InitSessionClientWithSessionID(sc *SessionClient, id int64) {
+	sc.SessionID = id
 	sc.seqTop = 0
 	sc.knownLeader = 0
-	DPrintf("New session: %d\n", sc.SessionID)
+}
+
+func InitSessionClient(sc *SessionClient) {
+	InitSessionClientWithSessionID(sc, NewSessionID())
 }
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	sc SessionClient
-}
-
-func nrand() int64 {
-	max := big.NewInt(int64(1) << 62)
-	bigx, _ := rand.Int(rand.Reader, max)
-	x := bigx.Int64()
-	return x
 }
 
 func (sc *SessionClient) NewSeq() int64 {
