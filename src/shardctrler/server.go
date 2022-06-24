@@ -62,7 +62,9 @@ func (sc *ShardCtrler) Move(rpc_args *sm.RPCSessionArgs, reply *sm.RPCSessionRep
 
 func (sc *ShardCtrler) Query(rpc_args *sm.RPCSessionArgs, reply *sm.RPCSessionReply) {
 	// Your code here.
+	DPrintf("Shard Controller %d: Query RPC: %v\n", sc.me, rpc_args)
 	*reply = sc.ss.HandleRPC(rpc_args, raftStart, sc, true)
+	DPrintf("Shard Controller %d: Query RPC: %v, reply: %v\n", sc.me, rpc_args, *reply)
 }
 
 //
