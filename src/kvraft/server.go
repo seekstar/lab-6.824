@@ -52,6 +52,7 @@ func (ss *SessionServer) EncodeTo(e *labgob.LabEncoder) {
 
 func (ss *SessionServer) DecodeFrom(d *labgob.LabDecoder) {
 	ss.mu.Lock()
+	ss.ReplyBuf = make(map[int64]replyWithSeq)
 	err := d.Decode(&ss.ReplyBuf)
 	crashIf(err)
 	ss.mu.Unlock()
