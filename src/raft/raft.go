@@ -295,9 +295,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	DPrintf("%d: Snapshot, index = %d\n", rf.me, index)
 	reply := make(chan struct{})
+	// If Snapshot is called while being killed, return immediately.
+	// If the snapshot is not installed, it does not affect anything.
+	// If the snapshot is installed in Raft, but the service have not installed
+	// it yet, the service will read the snapshot and install it anyway.
 	select {
 	case <-rf.quit:
-		fmt.Printf("%d: Snapshot called while being killed! How to handle this?\n", rf.me)
 		return
 	case rf.installSnapshotCh <- &InstallSnapshotChItem{
 		&SnapshotArgs{
@@ -312,7 +315,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	DPrintf("%d: Snapshot function waiting for reply of %d\n", rf.me, index)
 	select {
 	case <-rf.quit:
-		fmt.Printf("%d: Snapshot called while being killed! How to handle this?\n", rf.me)
 		return
 	case <-reply:
 	}
