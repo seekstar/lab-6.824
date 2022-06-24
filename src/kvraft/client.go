@@ -19,6 +19,7 @@ type SessionClient struct {
 	SessionID   int64
 	seqTop      int64
 	knownLeader int64
+	quit        chan struct{}
 }
 
 func NewSessionID() int64 {
@@ -29,14 +30,15 @@ func NewSessionID() int64 {
 	return x
 }
 
-func InitSessionClientWithSessionID(sc *SessionClient, id int64) {
+func InitSessionClientWithSessionID(sc *SessionClient, quit chan struct{}, id int64) {
 	sc.SessionID = id
 	sc.seqTop = 0
 	sc.knownLeader = 0
+	sc.quit = quit
 }
 
-func InitSessionClient(sc *SessionClient) {
-	InitSessionClientWithSessionID(sc, NewSessionID())
+func InitSessionClient(sc *SessionClient, quit chan struct{}) {
+	InitSessionClientWithSessionID(sc, quit, NewSessionID())
 }
 
 type Clerk struct {
@@ -54,7 +56,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
-	InitSessionClient(&ck.sc)
+	InitSessionClient(&ck.sc, nil)
 	return ck
 }
 
@@ -75,9 +77,6 @@ func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	DPrintf("%d: Get (%s)\n", ck.sc.SessionID, key)
 	rpc_reply := ck.sc.PutCommand(ck.servers, "KVServer.Get", GetArgs{Key: key})
-	if rpc_reply.Err == RPCErrKilled {
-		log.Fatalf("%d: Get (%s) returns RPCErrKilled\n", ck.sc.SessionID, key)
-	}
 	if rpc_reply.Err != RPCOK {
 		log.Fatalf("%d: Get (%s) returns unexpected RPC error: %d\n", ck.sc.SessionID, key, rpc_reply.Err)
 	}
@@ -115,9 +114,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			Op:    op,
 		},
 	)
-	if rpc_reply.Err == RPCErrKilled {
-		log.Fatalf("%d: %s (%s) (%s) returns RPCErrKilled\n", ck.sc.SessionID, op, key, value)
-	}
 	if rpc_reply.Err != RPCOK {
 		log.Fatalf("%d: %s (%s) (%s) returns unexpected RPC error: %d\n", ck.sc.SessionID, op, key, value, rpc_reply.Err)
 	}
@@ -178,8 +174,11 @@ func (sc *SessionClient) PutCommand(clients []*labrpc.ClientEnd, svcMeth string,
 	for {
 		go CallRPC(clients, i, svcMeth, &rpc_args, resChan, abort)
 		select {
+		case <-sc.quit:
+			close(abort)
+			return RPCSessionReply{Err: RPCErrAbort}
 		case <-time.After(time.Millisecond * 500):
-			DPrintf("Timeout\n")
+			DPrintf("%d: Timeout\n", sc.SessionID)
 		case res := <-resChan:
 			if res.reply.Err == RPCErrWrongLeader {
 				break

@@ -8,8 +8,12 @@ type RPCSessionArgs struct {
 
 const (
 	RPCOK int = iota
+	// The RPC session has aborted
+	RPCErrAbort
 	// The server has been killed
 	RPCErrKilled
+
+	// Handled internally
 	// The server is not a leader. The client should try another server.
 	RPCErrWrongLeader
 	// There is a newer request with the same session ID
